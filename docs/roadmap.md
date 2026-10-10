@@ -42,7 +42,7 @@ result table per workflow), the `skip-ci` label, and the severity policy
 
 | Level | What it covers |
 |---|---|
-| Run on GitHub | Everything in `ci.yml` and `security.yml` except CodeQL. A test consumer ([`checks-toolkit-test`](https://github.com/ops-lane/checks-toolkit-test)) calls both workflows over 20+ scenarios, each with an expected result: the right check fails for the right reason, the others pass, a hostile folder name is treated as text, a secret added and removed in a later commit is found without its value being printed, the `skip-ci` label skips everything and its removal restores the checks, and the two gate comments stay separate. The platform's self-test covers the Markdown matrix, the full-history secret scan and the new-branch fallback |
+| Run on GitHub | Everything in `ci.yml` and `security.yml` except CodeQL. A test consumer (`checks-toolkit-test`) calls both workflows over 20+ scenarios, each with an expected result: the right check fails for the right reason, the others pass, a hostile folder name is treated as text, a secret added and removed in a later commit is found without its value being printed, the `skip-ci` label skips everything and its removal restores the checks, and the two gate comments stay separate. The platform's self-test covers the Markdown matrix, the full-history secret scan and the new-branch fallback |
 | Not yet seen | A pull request from a fork (needs a public repository), a caller that triggers on `pull_request_target`, and `fail-on-findings: true` on `audit-python` |
 | Not run at all | **CodeQL.** It is off by default because it needs a public repository or GitHub Advanced Security; only its result mapping was tested. Semgrep, the other half of `scan-code`, has run locally |
 
