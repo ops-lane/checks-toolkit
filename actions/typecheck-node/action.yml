@@ -1,0 +1,82 @@
+name: "Typecheck Node"
+description: "Type-checks TypeScript with the project's own tsc (tsc --noEmit). Installs the project's dependencies WITHOUT running lifecycle scripts. Fails the step on a type error; errors are written to the job summary. Skips with a warning when the project has no tsconfig.json or no TypeScript."
+
+inputs:
+  working-directory:
+    description: "Directory to run tsc in — one component's path from detect-changes' components[] in a monorepo. Defaults to the repo root."
+    required: false
+    default: "."
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install dependencies
+      id: install
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        # Type checking needs the project's dependencies (their type
+        # declarations). --ignore-scripts: lifecycle scripts are code from
+        # the pull request, and type checking does not need them.
+        # Another step in the same job may already have installed them.
+        if [ -d node_modules ]; then
+          echo "node_modules already present - not installing again."
+          echo "manager=existing" >> "$GITHUB_OUTPUT"
+        elif [ -f pnpm-lock.yaml ]; then
+          echo "manager=pnpm" >> "$GITHUB_OUTPUT"
+          npx --yes pnpm@10.34.6 install --frozen-lockfile --ignore-scripts
+        elif [ -f yarn.lock ]; then
+          echo "::warning::yarn is not supported yet - dependencies are not installed."
+          echo "manager=yarn" >> "$GITHUB_OUTPUT"
+        elif [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+          echo "manager=npm" >> "$GITHUB_OUTPUT"
+          npm ci --ignore-scripts --no-audit --no-fund
+        else
+          echo "::warning::No lockfile found - installing without one, so versions are not reproducible."
+          echo "manager=npm" >> "$GITHUB_OUTPUT"
+          npm install --ignore-scripts --no-audit --no-fund
+        fi
+
+    - name: Run tsc
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        WORKING_DIR: ${{ inputs.working-directory }}
+      run: |
+        TSC=node_modules/.bin/tsc
+        if [ ! -f tsconfig.json ] || [ ! -x "$TSC" ]; then
+          echo "::notice::No tsconfig.json or no TypeScript in $WORKING_DIR - skipping typecheck-node."
+          {
+            echo "### typecheck-node — \`$WORKING_DIR\`"
+            echo ""
+            echo "**Skipped:** this project has no \`tsconfig.json\`, or TypeScript is not one of its dependencies."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+        fi
+
+        # --noEmit: only check, never write build output. tsc exits non-zero
+        # for type errors and for an unusable tsconfig alike; both come out
+        # as "error TS...." lines, so both are reported the same way.
+        set +e
+        "$TSC" --noEmit --pretty false > "$RUNNER_TEMP/tsc.txt" 2>&1
+        exit_code=$?
+        set -e
+
+        COUNT=$(grep -c ' error TS[0-9]' "$RUNNER_TEMP/tsc.txt" || true)
+
+        {
+          echo "### typecheck-node — \`$WORKING_DIR\`"
+          echo ""
+          echo "Type errors found: **$COUNT**"
+          if [ "$exit_code" -ne 0 ]; then
+            echo ""
+            echo '```text'
+            head -n 200 "$RUNNER_TEMP/tsc.txt"
+            echo '```'
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        if [ "$exit_code" -ne 0 ]; then
+          echo "::error::tsc reported problems in $WORKING_DIR (exit code $exit_code)"
+        fi
+        exit "$exit_code"

@@ -1,0 +1,23 @@
+version: 2
+
+updates:
+  - package-ecosystem: "github-actions"
+    # "/" covers .github/workflows. The composite actions each have their
+    # own action.yml in actions/<name>/, which Dependabot only finds when the
+    # folder is listed too.
+    directories:
+      - "/"
+      - "/actions/*"
+    schedule:
+      interval: "weekly"
+    # Wait a week before proposing a brand-new release. Compromised versions
+    # of popular actions have usually been spotted and pulled within days, so
+    # a delay keeps this repo from being among the first to take one.
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "ci(deps)"
+    groups:
+      all-deps:
+        patterns:
+          - "*"

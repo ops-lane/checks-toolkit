@@ -1,0 +1,175 @@
+name: "CI Gate"
+description: "Turns the results of a workflow's jobs into one verdict: builds a per-step result table (job summary and, on pull requests, a sticky comment) and fails when any job failed. Skipped jobs count as fine."
+
+inputs:
+  needs:
+    description: "The calling job's needs context serialized with toJSON(needs) - a composite action cannot read the needs context itself."
+    required: true
+  name:
+    description: "Name of the workflow this gate belongs to (CI, Security). Used as the title of the result table, to tell the sticky pull request comments of different workflows apart, and to find this workflow's jobs: the gate job must be named '<name> gate' (for example 'CI gate')."
+    required: false
+    default: "CI"
+  skipped-reason:
+    description: "When non-empty, the workflow was deliberately skipped (the skip-ci label) and this is the reason shown instead of a result table. The gate still passes: it is the one check that always runs, so a required check never stays pending."
+    required: false
+    default: ""
+  token:
+    description: "Token for the GitHub API (this run's jobs, the PR comment). Needs actions: read, plus pull-requests: write for the comment."
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  failed:
+    description: "Space-separated names of the jobs that did not pass; empty when everything passed or was skipped."
+    value: ${{ steps.evaluate.outputs.failed }}
+
+runs:
+  using: "composite"
+  steps:
+    # 1. Verdict - decided first, from the jobs' own results, but only
+    #    enforced in the last step so reporting can never change it.
+    - name: Evaluate job results
+      id: evaluate
+      shell: bash
+      env:
+        RESULTS: ${{ inputs.needs }}
+      run: |
+        # A job may legitimately be "skipped" (nothing of that type changed)
+        # - only a real "failure"/"cancelled" should block.
+        FAILED=$(echo "$RESULTS" | jq -r \
+          'to_entries[] | select(.value.result != "success" and .value.result != "skipped") | .key' \
+          | paste -sd ' ' -)
+        SKIPPED=$(echo "$RESULTS" | jq -r \
+          'to_entries | map(select(.value.result == "skipped") | .key) | join(", ")')
+        echo "failed=$FAILED" >> "$GITHUB_OUTPUT"
+        echo "skipped=$SKIPPED" >> "$GITHUB_OUTPUT"
+
+    # 2. Report - best effort. A broken report must not hide or flip the verdict.
+    - name: Build result table
+      id: report
+      continue-on-error: true
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        FAILED: ${{ steps.evaluate.outputs.failed }}
+        SKIPPED: ${{ steps.evaluate.outputs.skipped }}
+        GATE_NAME: ${{ inputs.name }}
+        SKIPPED_REASON: ${{ inputs.skipped-reason }}
+      run: |
+        set -euo pipefail
+
+        # One marker per workflow, so CI and Security each keep their own
+        # sticky comment instead of overwriting each other's.
+        MARKER="<!-- checks-toolkit-$(echo "$GATE_NAME" | tr '[:upper:] ' '[:lower:]-') -->"
+        echo "$MARKER" > "$RUNNER_TEMP/gate-marker.txt"
+
+        # One entry per job that ran; matrix instances are separate jobs.
+        gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100" \
+          --paginate --jq '.jobs[]' | jq -s '.' > "$RUNNER_TEMP/jobs.json"
+
+        # A caller that runs ci.yml and security.yml gets ONE run containing
+        # the jobs of both, so the jobs list holds both workflows. This gate's
+        # own job is named "<caller job id> / <name> gate" (for example
+        # "security / Security gate"); everything in front of "<name> gate" is
+        # the prefix that marks this workflow's jobs. Without a prefix (the
+        # workflow was run directly, not called) every job belongs here.
+        PREFIX=$(jq -r --arg g "$GATE_NAME gate" '
+          [.[] | select(.name | endswith($g))][0].name // ""
+          | .[0:(length - ($g | length))]' "$RUNNER_TEMP/jobs.json")
+
+        # Only the platform's own action steps (named <type>-<target>, see
+        # contributing.md) are rows; checkout/setup boilerplate is not.
+        rows=$(jq -r --arg prefix "$PREFIX" '
+          def dur:
+            if .conclusion != "skipped" and .started_at != null and .completed_at != null then
+              ((.completed_at | fromdateiso8601) - (.started_at | fromdateiso8601)) as $s
+              | if $s < 60 then "\($s)s" else "\($s / 60 | floor)m \($s % 60)s" end
+            else "-" end;
+          def status_name:
+            {"success":"passed","failure":"failed","skipped":"skipped","cancelled":"cancelled"}[.] // .;
+          sort_by(.name)[]
+          | select(.name | startswith($prefix))
+          | select(.name | test(" gate$") | not)
+          | select(.conclusion != "skipped")
+          | (.name | sub("^[^/]+ / "; "")) as $job
+          | .steps[]?
+          | select(.name | test("^(lint|typecheck|audit|scan|build)-[a-z]+$"))
+          | "| \($job) | \(.name) | \((.conclusion // "running") | status_name) | \(dur) |"
+        ' "$RUNNER_TEMP/jobs.json")
+
+        RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+        {
+          echo "$MARKER"
+          echo "## $GATE_NAME results"
+          echo
+          if [ -n "$SKIPPED_REASON" ]; then
+            echo "**Skipped:** $SKIPPED_REASON"
+            echo
+            echo "_Nothing was checked. A green $GATE_NAME check here does NOT mean the change was tested._"
+          elif [ -n "$rows" ]; then
+            echo "| Job | Step | Status | Duration |"
+            echo "|---|---|---|---|"
+            echo "$rows"
+          else
+            echo "No checks ran - nothing relevant changed."
+          fi
+          echo
+          if [ -n "$FAILED" ]; then
+            echo "**Verdict:** failed - $FAILED."
+          else
+            echo "**Verdict:** passed."
+          fi
+          [ -z "$SKIPPED" ] || [ -n "$SKIPPED_REASON" ] || echo "Skipped (nothing of that type changed): $SKIPPED."
+          echo
+          [ -n "$SKIPPED_REASON" ] || {
+            echo "_A row can be green and still list findings below the failure threshold - see that job's summary._"
+            echo
+          }
+          echo "_Run #$GITHUB_RUN_NUMBER - [full logs]($RUN_URL)_"
+        } > "$RUNNER_TEMP/comment.md"
+
+        cat "$RUNNER_TEMP/comment.md" >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Post or update the pull request comment
+      # Fork PRs and callers without pull-requests: write can't comment;
+      # the table is still in the job summary then.
+      if: ${{ !cancelled() && github.event_name == 'pull_request' && steps.report.outcome == 'success' }}
+      continue-on-error: true
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+        set -euo pipefail
+        # The marker identifies this workflow's own comment (see the report
+        # step); jq reads it from the environment.
+        export MARKER
+        MARKER=$(cat "$RUNNER_TEMP/gate-marker.txt")
+        comment_id=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" --paginate \
+          --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | startswith(env.MARKER))) | .id' \
+          | head -n 1)
+        if [ -n "$comment_id" ]; then
+          jq -n --rawfile body "$RUNNER_TEMP/comment.md" '{body: $body}' \
+            | gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$comment_id" --input -
+        else
+          jq -n --rawfile body "$RUNNER_TEMP/comment.md" '{body: $body}' \
+            | gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" --input -
+        fi
+
+    # 3. Enforce - fail closed: evaluating must have succeeded AND found no failure.
+    - name: Enforce verdict
+      if: always()
+      shell: bash
+      env:
+        EVALUATE_OUTCOME: ${{ steps.evaluate.outcome }}
+        FAILED: ${{ steps.evaluate.outputs.failed }}
+      run: |
+        if [ "$EVALUATE_OUTCOME" != "success" ]; then
+          echo "::error::Could not evaluate the job results."
+          exit 1
+        fi
+        if [ -n "$FAILED" ]; then
+          echo "::error::These jobs did not pass: $FAILED"
+          exit 1
+        fi
+        echo "All jobs passed (or were skipped)."

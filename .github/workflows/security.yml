@@ -1,0 +1,328 @@
+on:
+  workflow_call:
+    inputs:
+      platform-ref:
+        description: "Ref of ops-lane/checks-toolkit to check out for its own actions (a tag, branch, or commit SHA). Required, and must match the ref used in the caller's own `uses:` line - see ci.yml for why it cannot be detected automatically."
+        required: true
+        type: string
+      fail-on-severity:
+        description: "Lowest severity that fails a scan: critical, high, medium/moderate, low, or none (report only). Default is high: critical and high findings block, lower ones are only reported. Applies to every tool that reports a severity (audit-node, scan-docker, scan-terraform, scan-code)."
+        required: false
+        type: string
+        default: "high"
+      codeql:
+        description: "Also run CodeQL in the code job. Default is false and has to be switched on deliberately: CodeQL only works on a public repository or one with GitHub Advanced Security, and fails on any other private repository, which would turn the Security gate red. Semgrep always runs and is not affected."
+        required: false
+        type: boolean
+        default: false
+      fail-on-findings:
+        description: "Fail audit-python when it finds any vulnerability. Default is false (report only): pip-audit reports no severity, so there is no threshold to apply and it is all or nothing. Leaked secrets always block and are not affected by this input."
+        required: false
+        type: boolean
+        default: false
+      base-ref:
+        description: "Commit SHA to compare from, passed through to detect-changes and scan-secrets. Leave empty for automatic event-based resolution (which, under workflow_dispatch, has no real diff: nothing is reported as changed and secrets are scanned over the full history)."
+        required: false
+        type: string
+      head-ref:
+        description: "Commit SHA to compare to, passed through to detect-changes and scan-secrets. Leave empty for automatic event-based resolution."
+        required: false
+        type: string
+    secrets:
+      platform-read-token:
+        description: "Token with read access to ops-lane/checks-toolkit, needed only when an external repo calls this workflow (its default GITHUB_TOKEN has no access to checks-toolkit). Not needed when checks-toolkit calls itself (self-test.yml) - falls back to github.token then."
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  detect:
+    runs-on: ubuntu-26.04
+    outputs:
+      result: ${{ steps.detect.outputs.result }}
+      base-ref: ${{ steps.detect.outputs.base-ref }}
+      head-ref: ${{ steps.detect.outputs.head-ref }}
+      skip: ${{ steps.skip.outputs.skip }}
+      python-components: ${{ steps.filter.outputs.python-components }}
+      node-components: ${{ steps.filter.outputs.node-components }}
+      docker-components: ${{ steps.filter.outputs.docker-components }}
+      terraform-components: ${{ steps.filter.outputs.terraform-components }}
+    steps:
+      - name: Refuse to run on pull_request_target
+        if: github.event_name == 'pull_request_target'
+        shell: bash
+        run: |
+          echo "::error::This workflow must not be called from a pull_request_target event: it would run the pull request's code with write access and secrets. Use the pull_request trigger instead."
+          exit 1
+
+      - name: Check for the skip-ci label
+        id: skip
+        shell: bash
+        env:
+          # null outside pull requests, so only a pull request can skip.
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          # The label is a deliberate, maintainer-only override that also
+          # covers security (see docs/workflows.md). Every job below keys
+          # off this one output; the gate still runs and reports the skip.
+          if echo "$LABELS" | jq -e 'index("skip-ci")' > /dev/null; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::The skip-ci label is set - security checks are skipped."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Checkout checks-toolkit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: ops-lane/checks-toolkit
+          ref: ${{ inputs.platform-ref }}
+          path: .checks-toolkit
+          token: ${{ secrets.platform-read-token || github.token }}
+
+      - name: Detect changes
+        id: detect
+        uses: ./.checks-toolkit/actions/detect-changes
+        with:
+          base-ref: ${{ inputs.base-ref }}
+          head-ref: ${{ inputs.head-ref }}
+
+      - name: Filter changed components per capability
+        id: filter
+        shell: bash
+        env:
+          RESULT: ${{ steps.detect.outputs.result }}
+        run: |
+          for type in python node docker terraform; do
+            components=$(echo "$RESULT" | jq -c --arg type "$type" \
+              '[.components[] | select(.type == $type and .changed == true)]')
+            echo "${type}-components=$components" >> "$GITHUB_OUTPUT"
+          done
+
+  # Always on: not conditional on what changed. A secret can be hiding in
+  # any file type, including one no other check looks at.
+  secrets:
+    needs: detect
+    if: needs.detect.outputs.skip != 'true'
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # Gitleaks walks the commits of the pull request, so their history
+          # has to be present. A shallow clone would hide a secret that was
+          # added and removed again within the same pull request.
+          fetch-depth: 0
+
+      - name: Checkout checks-toolkit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: ops-lane/checks-toolkit
+          ref: ${{ inputs.platform-ref }}
+          path: .checks-toolkit
+          token: ${{ secrets.platform-read-token || github.token }}
+
+      - name: scan-secrets
+        uses: ./.checks-toolkit/actions/scan-secrets
+        with:
+          base-ref: ${{ needs.detect.outputs.base-ref }}
+          head-ref: ${{ needs.detect.outputs.head-ref }}
+
+  # One run over the whole repository: static analysis needs the full
+  # picture, not just the changed files. "changed" only decides whether it
+  # is worth starting; "project" decides which languages it analyzes.
+  code:
+    needs: detect
+    if: >-
+      needs.detect.outputs.skip != 'true' && (
+        fromJSON(needs.detect.outputs.result).changed.python ||
+        fromJSON(needs.detect.outputs.result).changed.node ||
+        fromJSON(needs.detect.outputs.result).changed.docker)
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Checkout checks-toolkit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: ops-lane/checks-toolkit
+          ref: ${{ inputs.platform-ref }}
+          path: .checks-toolkit
+          token: ${{ secrets.platform-read-token || github.token }}
+
+      - name: scan-code
+        uses: ./.checks-toolkit/actions/scan-code
+        with:
+          python: ${{ fromJSON(needs.detect.outputs.result).project.python }}
+          node: ${{ fromJSON(needs.detect.outputs.result).project.node }}
+          docker: ${{ fromJSON(needs.detect.outputs.result).project.docker }}
+          codeql: ${{ inputs.codeql }}
+          fail-on-severity: ${{ inputs.fail-on-severity }}
+
+  python:
+    name: python (${{ matrix.component.path }})
+    needs: detect
+    if: needs.detect.outputs.skip != 'true' && fromJSON(needs.detect.outputs.result).changed.python
+    runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix:
+        component: ${{ fromJSON(needs.detect.outputs.python-components) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Checkout checks-toolkit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: ops-lane/checks-toolkit
+          ref: ${{ inputs.platform-ref }}
+          path: .checks-toolkit
+          token: ${{ secrets.platform-read-token || github.token }}
+
+      - name: audit-python
+        uses: ./.checks-toolkit/actions/audit-python
+        with:
+          working-directory: ${{ matrix.component.path }}
+          fail-on-findings: ${{ inputs.fail-on-findings }}
+
+  node:
+    name: node (${{ matrix.component.path }})
+    needs: detect
+    if: needs.detect.outputs.skip != 'true' && fromJSON(needs.detect.outputs.result).changed.node
+    runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix:
+        component: ${{ fromJSON(needs.detect.outputs.node-components) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Checkout checks-toolkit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: ops-lane/checks-toolkit
+          ref: ${{ inputs.platform-ref }}
+          path: .checks-toolkit
+          token: ${{ secrets.platform-read-token || github.token }}
+
+      - name: audit-node
+        uses: ./.checks-toolkit/actions/audit-node
+        with:
+          working-directory: ${{ matrix.component.path }}
+          fail-on-severity: ${{ inputs.fail-on-severity }}
+
+  docker:
+    name: docker (${{ matrix.component.path }})
+    needs: detect
+    if: needs.detect.outputs.skip != 'true' && fromJSON(needs.detect.outputs.result).changed.docker
+    runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix:
+        component: ${{ fromJSON(needs.detect.outputs.docker-components) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Checkout checks-toolkit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: ops-lane/checks-toolkit
+          ref: ${{ inputs.platform-ref }}
+          path: .checks-toolkit
+          token: ${{ secrets.platform-read-token || github.token }}
+
+      # The image is built again here (ci.yml builds it too) because a
+      # separate workflow cannot share the local Docker image of another.
+      - name: build-docker
+        id: build
+        uses: ./.checks-toolkit/actions/build-docker
+        with:
+          working-directory: ${{ matrix.component.path }}
+
+      - name: scan-docker
+        uses: ./.checks-toolkit/actions/scan-docker
+        with:
+          image: ${{ steps.build.outputs.image }}
+          fail-on-severity: ${{ inputs.fail-on-severity }}
+
+  terraform:
+    name: terraform (${{ matrix.component.path }})
+    needs: detect
+    if: needs.detect.outputs.skip != 'true' && fromJSON(needs.detect.outputs.result).changed.terraform
+    runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix:
+        component: ${{ fromJSON(needs.detect.outputs.terraform-components) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Checkout checks-toolkit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: ops-lane/checks-toolkit
+          ref: ${{ inputs.platform-ref }}
+          path: .checks-toolkit
+          token: ${{ secrets.platform-read-token || github.token }}
+
+      - name: scan-terraform
+        uses: ./.checks-toolkit/actions/scan-terraform
+        with:
+          working-directory: ${{ matrix.component.path }}
+          fail-on-severity: ${{ inputs.fail-on-severity }}
+
+  security-gate:
+    name: Security gate
+    needs: [detect, secrets, code, python, node, docker, terraform]
+    if: always()
+    runs-on: ubuntu-26.04
+    # Same minimum as the CI gate (see ci.yml).
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: write
+    steps:
+      - name: Checkout checks-toolkit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: ops-lane/checks-toolkit
+          ref: ${{ inputs.platform-ref }}
+          path: .checks-toolkit
+          token: ${{ secrets.platform-read-token || github.token }}
+
+      - name: Gate
+        uses: ./.checks-toolkit/actions/ci-gate
+        with:
+          needs: ${{ toJSON(needs) }}
+          name: Security
+          skipped-reason: ${{ needs.detect.outputs.skip == 'true' && 'the skip-ci label is set on this pull request' || '' }}

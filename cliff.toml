@@ -1,0 +1,59 @@
+# git-cliff configuration for the release notes (https://git-cliff.org).
+#
+# The release workflow runs git-cliff over the commits since the last tag and
+# uses the result as the body of the GitHub Release. There is no changelog file
+# to keep in sync: the Releases page is the changelog.
+#
+# Commits must follow Conventional Commits ("feat: ...", "fix(scope): ...");
+# the check-commits workflow enforces that on pull requests. Anything else is
+# dropped from the notes (filter_unconventional), which is why it is enforced.
+
+[changelog]
+# No header or footer: the release page has its own title.
+header = ""
+footer = ""
+trim = true
+# One section per group, in the order given by the <!-- n --> prefixes (git-cliff
+# sorts groups by name; the comment decides the order and is stripped below).
+body = """
+{% for group, commits in commits | group_by(attribute="group") -%}
+### {{ group | striptags | trim }}
+{% for commit in commits %}
+- {% if commit.scope %}**{{ commit.scope }}:** {% endif -%}
+{{ commit.message | split(pat="\n") | first | upper_first | trim -}}
+{% if commit.breaking %} **(breaking change)**{% endif %} ({{ commit.id | truncate(length=7, end="") }})
+{%- endfor %}
+
+{% endfor %}
+"""
+
+[git]
+conventional_commits = true
+filter_unconventional = true
+protect_breaking_commits = true
+split_commits = false
+sort_commits = "oldest"
+tag_pattern = "v[0-9].*"
+
+commit_parsers = [
+  # Not content: merges and the release machinery itself.
+  { message = "^Merge ", skip = true },
+  { message = "^Revert \"", skip = true },
+  { message = "^(chore|ci)\\(release\\)", skip = true },
+
+  { message = "^feat", group = "<!-- 0 -->Added" },
+  { message = "^fix\\(security\\)", group = "<!-- 1 -->Security" },
+  { message = "^fix", group = "<!-- 2 -->Fixed" },
+  { message = "^(perf|refactor)", group = "<!-- 3 -->Changed" },
+  { message = "^docs", group = "<!-- 4 -->Documentation" },
+  { message = "^(build|ci|chore|test|style)", group = "<!-- 5 -->Maintenance" },
+]
+
+[bump]
+# Only a suggestion: the release workflow shows what git-cliff would pick in
+# its summary, but the version is always typed by a person. Before 1.0.0 the
+# interface may change, so a breaking change raises the minor version, not the
+# major one, and a feature raises the minor version too.
+initial_tag = "0.1.0"
+features_always_bump_minor = true
+breaking_always_bump_major = false

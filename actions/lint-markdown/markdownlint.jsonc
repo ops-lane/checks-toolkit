@@ -1,0 +1,18 @@
+// Default markdownlint rules for the platform. A consumer repo overrides
+// these by committing its own .markdownlint-cli2.jsonc (or
+// .markdownlint.jsonc): markdownlint-cli2 treats this file as the base
+// configuration and lets the nearest config next to the files win.
+{
+  "default": true,
+
+  // Line length: prose and especially tables are written as one long line
+  // per paragraph/row; wrapping them hurts diffs and table readability.
+  "MD013": false,
+
+  // Table column style: cosmetic (pipe alignment/spacing), not structure.
+  "MD060": false,
+
+  // Same heading text twice is fine when the headings sit under different
+  // parents (e.g. "Usage" in several sections).
+  "MD024": { "siblings_only": true }
+}

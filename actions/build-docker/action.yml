@@ -1,0 +1,81 @@
+name: "Build Docker"
+description: "Builds the component's Docker image locally to prove it builds. Never pushes, never passes secrets or build arguments. Skips with a notice when the directory has no Dockerfile (e.g. a compose-only component). The image tag is returned so scan-docker can scan it."
+
+inputs:
+  working-directory:
+    description: "Directory used as the Docker build context — one component's path from detect-changes' components[] in a monorepo. Defaults to the repo root."
+    required: false
+    default: "."
+  dockerfile:
+    description: "Dockerfile name inside working-directory."
+    required: false
+    default: "Dockerfile"
+
+outputs:
+  image:
+    description: "Tag of the image that was built (empty when there was nothing to build)"
+    value: ${{ steps.build.outputs.image }}
+  built:
+    description: "true if an image was built, false if the directory had no Dockerfile"
+    value: ${{ steps.build.outputs.built }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Build image
+      id: build
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        WORKING_DIR: ${{ inputs.working-directory }}
+        DOCKERFILE: ${{ inputs.dockerfile }}
+      run: |
+        if [ ! -f "$DOCKERFILE" ]; then
+          echo "::notice::No $DOCKERFILE in $WORKING_DIR - nothing to build."
+          echo "built=false" >> "$GITHUB_OUTPUT"
+          echo "image=" >> "$GITHUB_OUTPUT"
+          {
+            echo "### build-docker — \`$WORKING_DIR\`"
+            echo ""
+            echo "**Skipped:** no \`$DOCKERFILE\` in this directory."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+        fi
+
+        # Image names must be lowercase and use a limited alphabet, so the
+        # component path is turned into a safe slug ("." becomes "root").
+        SLUG=$(echo "$WORKING_DIR" | tr '[:upper:]' '[:lower:]' | sed -E 's#^\./##; s#[^a-z0-9]+#-#g; s#^-+|-+$##g')
+        [ -n "$SLUG" ] || SLUG=root
+        IMAGE="ci-build/$SLUG:${GITHUB_SHA:0:12}"
+
+        # Build only. No --push, no --secret, no --build-arg: a pull
+        # request's Dockerfile gets nothing from the runner. Its RUN steps
+        # do execute, which is why this belongs on an ephemeral runner.
+        set +e
+        docker build --file "$DOCKERFILE" --tag "$IMAGE" --progress plain . > "$RUNNER_TEMP/docker-build.txt" 2>&1
+        exit_code=$?
+        set -e
+
+        if [ "$exit_code" -ne 0 ]; then
+          echo "::error::docker build failed in $WORKING_DIR (exit code $exit_code)"
+          tail -n 60 "$RUNNER_TEMP/docker-build.txt"
+          {
+            echo "### build-docker — \`$WORKING_DIR\`"
+            echo ""
+            echo "The image did not build. Last lines of the build log:"
+            echo ""
+            echo '```text'
+            tail -n 40 "$RUNNER_TEMP/docker-build.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$exit_code"
+        fi
+
+        SIZE=$(docker image inspect "$IMAGE" --format '{{.Size}}' | awk '{printf "%.1f MB", $1 / 1000000}')
+        echo "built=true" >> "$GITHUB_OUTPUT"
+        echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+        {
+          echo "### build-docker — \`$WORKING_DIR\`"
+          echo ""
+          echo "Built \`$IMAGE\` ($SIZE). Not pushed."
+        } >> "$GITHUB_STEP_SUMMARY"

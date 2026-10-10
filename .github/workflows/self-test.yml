@@ -1,0 +1,58 @@
+name: Self-test
+
+on:
+  push:
+    branches: [development]
+  pull_request:
+    # labeled/unlabeled: so adding or removing the skip-ci label starts a new run
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  workflow_dispatch:
+    inputs:
+      fail-on-findings:
+        description: "Fail audit-python when vulnerabilities are found, and lint-markdown when it finds broken links"
+        required: false
+        type: boolean
+        default: false
+      codeql:
+        description: "Also run CodeQL in the security workflow. Needs a public repository or GitHub Advanced Security."
+        required: false
+        type: boolean
+        default: false
+      base-ref:
+        description: "Commit SHA to compare from (for detect-changes). Leave empty to fall back to event-based resolution — which, under workflow_dispatch, has no real diff and reports no changes."
+        required: false
+        type: string
+      head-ref:
+        description: "Commit SHA to compare to (for detect-changes). Leave empty to fall back to event-based resolution."
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: write
+    uses: ./.github/workflows/ci.yml
+    with:
+      platform-ref: ${{ github.sha }}
+      fail-on-findings: ${{ github.event_name == 'workflow_dispatch' && inputs.fail-on-findings == true }}
+      base-ref: ${{ inputs.base-ref }}
+      head-ref: ${{ inputs.head-ref }}
+
+  security:
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: write
+    uses: ./.github/workflows/security.yml
+    with:
+      # Same reasoning as for ci above.
+      platform-ref: ${{ github.sha }}
+      codeql: ${{ github.event_name == 'workflow_dispatch' && inputs.codeql == true }}
+      fail-on-findings: ${{ github.event_name == 'workflow_dispatch' && inputs.fail-on-findings == true }}
+      base-ref: ${{ inputs.base-ref }}
+      head-ref: ${{ inputs.head-ref }}

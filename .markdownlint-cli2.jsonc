@@ -1,0 +1,8 @@
+// Repo-level markdownlint-cli2 settings for the Markdown in the repo root.
+// The shared default rules live in actions/lint-markdown/markdownlint.jsonc.
+// Note: "ignores" only applies to the directory the config sits in, because
+// ci.yml lints each component (directory) separately.
+{
+  "ignores": [
+  ]
+}

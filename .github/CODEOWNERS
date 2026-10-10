@@ -1,0 +1,10 @@
+# Who must review changes to which files. GitHub requests a review from the
+# owner automatically, and with the branch protection rule "Require review
+# from Code Owners" it also makes that review mandatory.
+#
+# These workflows and actions run in other repositories' pipelines, with
+# their tokens, so a change anywhere here is a change to what runs there.
+# Everything therefore has one owner for now; split it up if more
+# maintainers join.
+
+* @Sander-Code

@@ -1,0 +1,172 @@
+name: Test Action
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Which action (from actions/) to run standalone"
+        required: true
+        type: choice
+        default: audit-python
+        options:
+          - detect-changes
+          - lint-python
+          - typecheck-python
+          - audit-python
+          - lint-node
+          - typecheck-node
+          - audit-node
+          - build-docker
+          - scan-docker
+          - lint-terraform
+          - scan-terraform
+          - lint-workflows
+          - scan-workflows
+          - lint-markdown
+          - scan-secrets
+          - scan-code
+      working-directory:
+        description: "Directory the action runs in (the component path) - used by every action that takes a working-directory, so point it at a folder in this repo that has something to check. Defaults to the repo root."
+        required: false
+        default: "."
+      base-ref:
+        description: "Only used when action=detect-changes: commit SHA to compare from. Leave empty to fall back to event-based resolution (which, under workflow_dispatch, has no real diff and reports no changes)."
+        required: false
+      head-ref:
+        description: "Only used when action=detect-changes: commit SHA to compare to. Leave empty to fall back to event-based resolution."
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  test-action:
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # scan-secrets walks the commit history.
+          fetch-depth: 0
+
+      - name: detect-changes
+        if: inputs.action == 'detect-changes'
+        id: detect-changes
+        uses: ./actions/detect-changes
+        with:
+          base-ref: ${{ inputs.base-ref }}
+          head-ref: ${{ inputs.head-ref }}
+
+      - name: lint-python
+        if: inputs.action == 'lint-python'
+        id: lint-python
+        uses: ./actions/lint-python
+        with:
+          working-directory: ${{ inputs.working-directory }}
+
+      - name: typecheck-python
+        if: inputs.action == 'typecheck-python'
+        id: typecheck-python
+        uses: ./actions/typecheck-python
+        with:
+          working-directory: ${{ inputs.working-directory }}
+
+      - name: audit-python
+        if: inputs.action == 'audit-python'
+        id: audit-python
+        uses: ./actions/audit-python
+        with:
+          working-directory: ${{ inputs.working-directory }}
+
+      - name: lint-node
+        if: inputs.action == 'lint-node'
+        id: lint-node
+        uses: ./actions/lint-node
+        with:
+          working-directory: ${{ inputs.working-directory }}
+
+      - name: typecheck-node
+        if: inputs.action == 'typecheck-node'
+        id: typecheck-node
+        uses: ./actions/typecheck-node
+        with:
+          working-directory: ${{ inputs.working-directory }}
+
+      - name: audit-node
+        if: inputs.action == 'audit-node'
+        id: audit-node
+        uses: ./actions/audit-node
+        with:
+          working-directory: ${{ inputs.working-directory }}
+
+      - name: build-docker
+        if: inputs.action == 'build-docker' || inputs.action == 'scan-docker'
+        id: build-docker
+        uses: ./actions/build-docker
+        with:
+          working-directory: ${{ inputs.working-directory }}
+
+      # scan-docker needs an image, so selecting it also builds one first.
+      - name: scan-docker
+        if: inputs.action == 'scan-docker'
+        id: scan-docker
+        uses: ./actions/scan-docker
+        with:
+          image: ${{ steps.build-docker.outputs.image }}
+
+      - name: lint-terraform
+        if: inputs.action == 'lint-terraform'
+        id: lint-terraform
+        uses: ./actions/lint-terraform
+        with:
+          working-directory: ${{ inputs.working-directory }}
+
+      - name: scan-terraform
+        if: inputs.action == 'scan-terraform'
+        id: scan-terraform
+        uses: ./actions/scan-terraform
+        with:
+          working-directory: ${{ inputs.working-directory }}
+
+      - name: lint-workflows
+        if: inputs.action == 'lint-workflows'
+        id: lint-workflows
+        uses: ./actions/lint-workflows
+
+      - name: scan-workflows
+        if: inputs.action == 'scan-workflows'
+        id: scan-workflows
+        uses: ./actions/scan-workflows
+        with:
+          paths: ".github actions"
+
+      - name: lint-markdown
+        if: inputs.action == 'lint-markdown'
+        id: lint-markdown
+        uses: ./actions/lint-markdown
+        with:
+          working-directory: ${{ inputs.working-directory }}
+
+      - name: scan-secrets
+        if: inputs.action == 'scan-secrets'
+        id: scan-secrets
+        uses: ./actions/scan-secrets
+
+      # Which languages to analyze: whichever the repo has, same as the
+      # security workflow derives from detect-changes.
+      - name: scan-code
+        if: inputs.action == 'scan-code'
+        id: scan-code
+        uses: ./actions/scan-code
+        with:
+          python: "true"
+          node: "true"
+          docker: "true"
+
+      - name: Show outputs
+        if: always()
+        shell: bash
+        env:
+          STEPS_JSON: ${{ toJSON(steps) }}
+        run: echo "$STEPS_JSON"

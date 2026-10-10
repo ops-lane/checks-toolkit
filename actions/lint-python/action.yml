@@ -1,0 +1,42 @@
+name: "Lint Python"
+description: "Lints Python code with Ruff. Fails the step when Ruff finds an issue; findings are also written to the job summary."
+
+inputs:
+  working-directory:
+    description: "Directory to run Ruff in — one component's path from detect-changes' components[] in a monorepo. Defaults to the repo root."
+    required: false
+    default: "."
+
+runs:
+  using: "composite"
+  steps:
+    - name: Run Ruff
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        WORKING_DIR: ${{ inputs.working-directory }}
+      run: |
+        # Pinned (not "latest") so a new Ruff release cannot change the
+        # result of an unchanged pull request. Bump deliberately.
+        pip install --no-cache-dir --break-system-packages --ignore-installed ruff==0.16.10
+
+        set +e
+        ruff check . --output-format=json > ruff-result.json
+        exit_code=$?
+        set -e
+
+        COUNT=$(jq 'length' ruff-result.json)
+
+        {
+          echo "### lint-python — \`$WORKING_DIR\`"
+          echo ""
+          echo "Issues found: **$COUNT**"
+          if [ "$COUNT" -gt 0 ]; then
+            echo ""
+            echo "| File | Rule | Message |"
+            echo "|---|---|---|"
+            jq -r '.[] | "| \(.filename):\(.location.row) | \(.code) | \(.message) |"' ruff-result.json
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        exit "$exit_code"

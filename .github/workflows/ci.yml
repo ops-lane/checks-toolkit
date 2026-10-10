@@ -1,0 +1,292 @@
+on:
+  workflow_call:
+    inputs:
+      platform-ref:
+        description: "Ref of ops-lane/checks-toolkit to check out for its own actions (a tag, branch, or commit SHA). Required: there is no reliable way for a reusable workflow to auto-detect which ref of itself was used to call it (github.workflow_ref/github.sha etc. all reflect the top-level caller's context instead) - the caller must pass this explicitly, matching whatever ref it used in its own `uses:` line."
+        required: true
+        type: string
+      fail-on-findings:
+        description: "Fail lint-markdown when it finds broken links. Default is false (report only): link checks depend on third-party sites, so a failure often has nothing to do with the change. Security findings (dependencies, secrets, code) are not part of this workflow - see security.yml."
+        required: false
+        type: boolean
+        default: false
+      base-ref:
+        description: "Commit SHA to compare from, passed through to detect-changes. Leave empty for automatic event-based resolution (which, under workflow_dispatch, has no real diff and reports no changes)."
+        required: false
+        type: string
+      head-ref:
+        description: "Commit SHA to compare to, passed through to detect-changes. Leave empty for automatic event-based resolution."
+        required: false
+        type: string
+    secrets:
+      platform-read-token:
+        description: "Token with read access to ops-lane/checks-toolkit, needed only when an external repo calls this workflow (its default GITHUB_TOKEN has no access to checks-toolkit). Not needed when checks-toolkit calls itself (self-test.yml) - falls back to github.token then."
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  detect:
+    runs-on: ubuntu-26.04
+    outputs:
+      result: ${{ steps.detect.outputs.result }}
+      skip: ${{ steps.skip.outputs.skip }}
+      python-components: ${{ steps.filter.outputs.python-components }}
+      node-components: ${{ steps.filter.outputs.node-components }}
+      docker-components: ${{ steps.filter.outputs.docker-components }}
+      terraform-components: ${{ steps.filter.outputs.terraform-components }}
+      markdown-components: ${{ steps.filter.outputs.markdown-components }}
+    steps:
+      - name: Refuse to run on pull_request_target
+        # pull_request runs with a read-only token and no secrets, so it is
+        # safe to run a fork's code. pull_request_target runs with write
+        # access and secrets, so running a fork's code there hands them over.
+        # These workflows check out and run code from the event, so they are
+        # only meant for pull_request, push and workflow_dispatch. Failing
+        # loudly beats silently scanning the wrong code.
+        if: github.event_name == 'pull_request_target'
+        shell: bash
+        run: |
+          echo "::error::This workflow must not be called from a pull_request_target event: it would run the pull request's code with write access and secrets. Use the pull_request trigger instead."
+          exit 1
+
+      - name: Check for the skip-ci label
+        id: skip
+        shell: bash
+        env:
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          # The label is a deliberate, maintainer-only override (see
+          # docs/workflows.md). Every job below keys off this one output;
+          # the gate still runs and reports the skip, so the required check
+          # turns green instead of staying pending.
+          if echo "$LABELS" | jq -e 'index("skip-ci")' > /dev/null; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::The skip-ci label is set - CI is skipped."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Checkout checks-toolkit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: ops-lane/checks-toolkit
+          ref: ${{ inputs.platform-ref }}
+          path: .checks-toolkit
+          token: ${{ secrets.platform-read-token || github.token }}
+
+      - name: Detect changes
+        id: detect
+        uses: ./.checks-toolkit/actions/detect-changes
+        with:
+          base-ref: ${{ inputs.base-ref }}
+          head-ref: ${{ inputs.head-ref }}
+
+      - name: Filter changed components per capability
+        id: filter
+        shell: bash
+        env:
+          RESULT: ${{ steps.detect.outputs.result }}
+        run: |
+          # detect-changes only reports one combined components[] array.
+          # A matrix needs one filtered, changed-only array per capability,
+          # so that filtering happens here, in the consuming workflow,
+          # instead of being baked into the (deliberately generic) action.
+          for type in python node docker terraform markdown; do
+            components=$(echo "$RESULT" | jq -c --arg type "$type" \
+              '[.components[] | select(.type == $type and .changed == true)]')
+            echo "${type}-components=$components" >> "$GITHUB_OUTPUT"
+          done
+
+  python:
+    name: python (${{ matrix.component.path }})
+    needs: detect
+    if: needs.detect.outputs.skip != 'true' && fromJSON(needs.detect.outputs.result).changed.python
+    runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix:
+        component: ${{ fromJSON(needs.detect.outputs.python-components) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Checkout checks-toolkit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: ops-lane/checks-toolkit
+          ref: ${{ inputs.platform-ref }}
+          path: .checks-toolkit
+          token: ${{ secrets.platform-read-token || github.token }}
+
+      - name: lint-python
+        uses: ./.checks-toolkit/actions/lint-python
+        with:
+          working-directory: ${{ matrix.component.path }}
+
+      - name: typecheck-python
+        uses: ./.checks-toolkit/actions/typecheck-python
+        with:
+          working-directory: ${{ matrix.component.path }}
+
+  node:
+    name: node (${{ matrix.component.path }})
+    needs: detect
+    if: needs.detect.outputs.skip != 'true' && fromJSON(needs.detect.outputs.result).changed.node
+    runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix:
+        component: ${{ fromJSON(needs.detect.outputs.node-components) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Checkout checks-toolkit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: ops-lane/checks-toolkit
+          ref: ${{ inputs.platform-ref }}
+          path: .checks-toolkit
+          token: ${{ secrets.platform-read-token || github.token }}
+
+      - name: lint-node
+        uses: ./.checks-toolkit/actions/lint-node
+        with:
+          working-directory: ${{ matrix.component.path }}
+
+      - name: typecheck-node
+        uses: ./.checks-toolkit/actions/typecheck-node
+        with:
+          working-directory: ${{ matrix.component.path }}
+
+  docker:
+    name: docker (${{ matrix.component.path }})
+    needs: detect
+    if: needs.detect.outputs.skip != 'true' && fromJSON(needs.detect.outputs.result).changed.docker
+    runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix:
+        component: ${{ fromJSON(needs.detect.outputs.docker-components) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Checkout checks-toolkit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: ops-lane/checks-toolkit
+          ref: ${{ inputs.platform-ref }}
+          path: .checks-toolkit
+          token: ${{ secrets.platform-read-token || github.token }}
+
+      - name: build-docker
+        uses: ./.checks-toolkit/actions/build-docker
+        with:
+          working-directory: ${{ matrix.component.path }}
+
+  terraform:
+    name: terraform (${{ matrix.component.path }})
+    needs: detect
+    if: needs.detect.outputs.skip != 'true' && fromJSON(needs.detect.outputs.result).changed.terraform
+    runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix:
+        component: ${{ fromJSON(needs.detect.outputs.terraform-components) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Checkout checks-toolkit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: ops-lane/checks-toolkit
+          ref: ${{ inputs.platform-ref }}
+          path: .checks-toolkit
+          token: ${{ secrets.platform-read-token || github.token }}
+
+      - name: lint-terraform
+        uses: ./.checks-toolkit/actions/lint-terraform
+        with:
+          working-directory: ${{ matrix.component.path }}
+
+  markdown:
+    name: markdown (${{ matrix.component.path }})
+    needs: detect
+    if: needs.detect.outputs.skip != 'true' && fromJSON(needs.detect.outputs.result).changed.markdown
+    runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix:
+        component: ${{ fromJSON(needs.detect.outputs.markdown-components) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Checkout checks-toolkit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: ops-lane/checks-toolkit
+          ref: ${{ inputs.platform-ref }}
+          path: .checks-toolkit
+          token: ${{ secrets.platform-read-token || github.token }}
+
+      - name: lint-markdown
+        uses: ./.checks-toolkit/actions/lint-markdown
+        with:
+          working-directory: ${{ matrix.component.path }}
+          fail-on-broken-links: ${{ inputs.fail-on-findings }}
+
+  ci-gate:
+    name: CI gate
+    needs: [detect, python, node, docker, terraform, markdown]
+    if: always()
+    runs-on: ubuntu-26.04
+    # Callers must grant at least these (a called workflow can't elevate
+    # beyond what its caller allows, and a request above that stops the
+    # whole run at startup). actions: read is for the jobs API behind the
+    # result table, pull-requests: write for the PR comment.
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: write
+    steps:
+      - name: Checkout checks-toolkit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: ops-lane/checks-toolkit
+          ref: ${{ inputs.platform-ref }}
+          path: .checks-toolkit
+          token: ${{ secrets.platform-read-token || github.token }}
+
+      - name: Gate
+        uses: ./.checks-toolkit/actions/ci-gate
+        with:
+          needs: ${{ toJSON(needs) }}
+          name: CI
+          skipped-reason: ${{ needs.detect.outputs.skip == 'true' && 'the skip-ci label is set on this pull request' || '' }}

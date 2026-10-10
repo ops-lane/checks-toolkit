@@ -1,0 +1,128 @@
+name: "Audit Node"
+description: "Checks Node dependencies for known vulnerabilities with npm audit or pnpm audit, matching the detected lockfile. Reads the lockfile only - nothing is installed. Fails the step when a vulnerability at or above fail-on-severity is found; every finding is written to the job summary. yarn is not supported yet."
+
+inputs:
+  working-directory:
+    description: "Directory to audit — one component's path from detect-changes' components[] in a monorepo. Defaults to the repo root."
+    required: false
+    default: "."
+  fail-on-severity:
+    description: "Lowest severity that fails this step: critical, high, moderate (or medium, the same thing: npm and pnpm say moderate, the other scan actions say medium), low, or none (never fail, report only). Default is high, so critical and high block while moderate and low are only reported."
+    required: false
+    default: "high"
+
+outputs:
+  manager:
+    description: "Which package manager's audit was used: npm, pnpm, or none (no supported lockfile)"
+    value: ${{ steps.audit.outputs.manager }}
+  vulnerability-count:
+    description: "Total number of findings (0 if none, or if nothing was audited). npm counts vulnerable packages, pnpm counts advisories, so the numbers are not comparable across the two."
+    value: ${{ steps.audit.outputs.vulnerability-count }}
+  result:
+    description: "Vulnerability counts per severity as JSON: {info, low, moderate, high, critical, total}"
+    value: ${{ steps.audit.outputs.result }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Audit dependencies
+      id: audit
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        WORKING_DIR: ${{ inputs.working-directory }}
+        FAIL_ON_SEVERITY: ${{ inputs.fail-on-severity }}
+      run: |
+        EMPTY='{"info":0,"low":0,"moderate":0,"high":0,"critical":0,"total":0}'
+
+        case "$FAIL_ON_SEVERITY" in
+          medium) FAIL_ON_SEVERITY=moderate ;;   # same level, other word
+          critical|high|moderate|low|none) ;;
+          *) echo "::error::fail-on-severity must be critical, high, moderate (or medium), low or none (got '$FAIL_ON_SEVERITY')"; exit 1 ;;
+        esac
+
+        nothing_audited() {
+          echo "manager=none" >> "$GITHUB_OUTPUT"
+          echo "vulnerability-count=0" >> "$GITHUB_OUTPUT"
+          echo "result=$EMPTY" >> "$GITHUB_OUTPUT"
+          {
+            echo "### audit-node — \`$WORKING_DIR\`"
+            echo ""
+            echo "$1"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::warning::$1"
+          exit 0
+        }
+
+        # Which tool to use follows the lockfile, because the audit works
+        # from the exact versions in it.
+        if [ -f pnpm-lock.yaml ]; then
+          MANAGER=pnpm
+        elif [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+          MANAGER=npm
+        elif [ -f yarn.lock ]; then
+          nothing_audited "yarn is not supported yet - nothing audited."
+        else
+          nothing_audited "No supported lockfile (package-lock.json, pnpm-lock.yaml) found - nothing audited."
+        fi
+        echo "manager=$MANAGER" >> "$GITHUB_OUTPUT"
+        echo "Detected $MANAGER"
+
+        # Both tools exit non-zero when they find vulnerabilities, so the
+        # exit code cannot tell "found something" from "could not run".
+        # Success is judged on the output instead: a report with a
+        # metadata.vulnerabilities object means the audit ran.
+        set +e
+        if [ "$MANAGER" = "pnpm" ]; then
+          npx --yes pnpm@10.34.6 audit --json > "$RUNNER_TEMP/audit.json" 2> "$RUNNER_TEMP/audit.err"
+        else
+          npm audit --json > "$RUNNER_TEMP/audit.json" 2> "$RUNNER_TEMP/audit.err"
+        fi
+        exit_code=$?
+        set -e
+
+        if ! jq -e '.metadata.vulnerabilities' "$RUNNER_TEMP/audit.json" > /dev/null 2>&1; then
+          echo "::error::$MANAGER audit failed to run (exit code $exit_code) - this is a tool/execution error, not a vulnerability finding."
+          cat "$RUNNER_TEMP/audit.err" "$RUNNER_TEMP/audit.json"
+          exit 1
+        fi
+
+        RESULT=$(jq -c --argjson empty "$EMPTY" '$empty + (.metadata.vulnerabilities | with_entries(select(.key != "total")))
+          | .total = (.info + .low + .moderate + .high + .critical)' "$RUNNER_TEMP/audit.json")
+        TOTAL=$(echo "$RESULT" | jq '.total')
+        echo "vulnerability-count=$TOTAL" >> "$GITHUB_OUTPUT"
+        echo "result=$RESULT" >> "$GITHUB_OUTPUT"
+
+        # How many findings are at or above the threshold.
+        BLOCKING=$(echo "$RESULT" | jq --arg t "$FAIL_ON_SEVERITY" '
+          ["critical","high","moderate","low"] as $order
+          | if $t == "none" then 0
+            else ($order | index($t)) as $i | [$order[:$i + 1][] as $s | .[$s]] | add end')
+
+        {
+          echo "### audit-node — \`$WORKING_DIR\` ($MANAGER)"
+          echo ""
+          echo "Findings: **$TOTAL** — critical $(echo "$RESULT" | jq .critical), high $(echo "$RESULT" | jq .high), moderate $(echo "$RESULT" | jq .moderate), low $(echo "$RESULT" | jq .low)"
+          if [ "$TOTAL" -gt 0 ]; then
+            echo ""
+            echo "| Package | Severity | Detail |"
+            echo "|---|---|---|"
+            if [ "$MANAGER" = "pnpm" ]; then
+              jq -r '[.advisories[]? | "| \(.module_name) | \(.severity) | \(.title | gsub("\\|"; "\\|")) (vulnerable: \(.vulnerable_versions); patched: \(.patched_versions)) |"] | unique | .[:100][]' "$RUNNER_TEMP/audit.json"
+            else
+              jq -r '[.vulnerabilities[]? | "| \(.name) | \(.severity) | \(if .isDirect then "direct" else "transitive" end) dependency, vulnerable range \(.range)\(if .fixAvailable == false then ", no fix available" else "" end) |"] | .[:100][]' "$RUNNER_TEMP/audit.json"
+            fi
+          fi
+          echo ""
+          if [ "$FAIL_ON_SEVERITY" = "none" ]; then
+            echo "_Report only (fail-on-severity: none)._"
+          else
+            echo "_Fails on **$FAIL_ON_SEVERITY** and above: $BLOCKING finding(s) at or above that level._"
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        if [ "$BLOCKING" -gt 0 ]; then
+          echo "::error::$BLOCKING finding(s) at '$FAIL_ON_SEVERITY' or above in $WORKING_DIR"
+          exit 1
+        fi
+        echo "$TOTAL finding(s), none at '$FAIL_ON_SEVERITY' or above."

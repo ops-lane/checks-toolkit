@@ -1,0 +1,131 @@
+name: "Audit Python"
+description: "Checks Python dependencies for known vulnerabilities with pip-audit, regardless of whether the project uses pip, Pipenv, or Poetry. Reports findings as outputs and in the job summary; only fails the step if fail-on-findings is enabled."
+
+inputs:
+  working-directory:
+    description: "Directory to run pip-audit in — one component's path from detect-changes' components[] in a monorepo. Defaults to the repo root."
+    required: false
+    default: "."
+  fail-on-findings:
+    description: "Fail this step when vulnerabilities are found. Default is false (report only) — pip-audit has no severity field, so this is an all-or-nothing switch, not a severity threshold."
+    required: false
+    default: "false"
+
+outputs:
+  manager:
+    description: "Which package manager was detected: poetry, pipenv, pip, or none"
+    value: ${{ steps.install.outputs.manager }}
+  vulnerability-count:
+    description: "Number of distinct vulnerabilities pip-audit found (0 if none, or if no dependency file was found)"
+    value: ${{ steps.audit.outputs.vulnerability-count }}
+  result:
+    description: "Raw pip-audit JSON output (dependencies + their vulns); an empty dependencies list if no dependency file was found"
+    value: ${{ steps.audit.outputs.result }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Resolve dependencies to a plain requirements file
+      id: install
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        # pip-audit reads a plain requirements.txt-style file rather than
+        # auditing an installed environment. Auditing an environment also
+        # reports on whatever happens to be installed alongside the
+        # project (pip itself, pip-audit's own dependencies, etc.) — noise
+        # that has nothing to do with what this project actually declared.
+        if [ -f "poetry.lock" ] || [ -f "pyproject.toml" ]; then
+          echo "Detected Poetry (poetry.lock/pyproject.toml)"
+          echo "manager=poetry" >> "$GITHUB_OUTPUT"
+          # The export plugin goes in with pip, next to poetry. `poetry self
+          # add` exits 0 on a GitHub-hosted runner but installs into an
+          # environment poetry never loads, so `poetry export` then fails
+          # with "command export does not exist" (reproduced in a clean
+          # non-root ubuntu:24.04 container).
+          pip install --no-cache-dir --break-system-packages --ignore-installed poetry==2.5.1 poetry-plugin-export==1.10.1
+          poetry lock
+          poetry export --format requirements.txt --without-hashes --output audit-requirements.txt
+        elif [ -f "Pipfile.lock" ] || [ -f "Pipfile" ]; then
+          echo "Detected Pipenv (Pipfile)"
+          echo "manager=pipenv" >> "$GITHUB_OUTPUT"
+          pip install --no-cache-dir --break-system-packages --ignore-installed pipenv==2026.8.0
+          pipenv lock
+          pipenv requirements > audit-requirements.txt
+        elif [ -f "requirements.txt" ]; then
+          echo "Detected pip (requirements.txt)"
+          echo "manager=pip" >> "$GITHUB_OUTPUT"
+          cp requirements.txt audit-requirements.txt
+        else
+          echo "::warning::No recognized Python dependency file found (poetry.lock, Pipfile, requirements.txt) — skipping pip-audit."
+          echo "manager=none" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Run pip-audit and capture results
+      id: audit
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        WORKING_DIR: ${{ inputs.working-directory }}
+        FAIL_ON_FINDINGS: ${{ inputs.fail-on-findings }}
+      run: |
+        if [ ! -f "audit-requirements.txt" ]; then
+          echo "vulnerability-count=0" >> "$GITHUB_OUTPUT"
+          echo "result={\"dependencies\":[],\"fixes\":[]}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### audit-python — \`$WORKING_DIR\`"
+            echo ""
+            echo "No recognized Python dependency file found — nothing audited."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+        fi
+
+        # Pinned: this tool decides a security verdict, so a new release must
+        # not change the result of an unchanged pull request. Bump deliberately.
+        pip install --no-cache-dir --break-system-packages --ignore-installed pip-audit==2.10.1
+
+        set +e
+        pip-audit -r audit-requirements.txt --format json > pip-audit-result.json
+        exit_code=$?
+        set -e
+
+        # pip-audit exits 0 (clean) or 1 (vulnerabilities found) for normal operation.
+        # Anything else means the tool itself failed to run — a real error, not a finding.
+        if [ "$exit_code" -gt 1 ]; then
+          echo "::error::pip-audit failed to run (exit code $exit_code) — this is a tool/execution error, not a vulnerability finding."
+          cat pip-audit-result.json
+          exit "$exit_code"
+        fi
+
+        RESULT_JSON=$(jq -c . pip-audit-result.json)
+        # pip-audit can list the same vulnerability more than once per package
+        # (e.g. once per advisory source it pulled the record from), so count
+        # distinct IDs rather than raw array length, or the same CVE inflates
+        # the count once for every duplicate entry.
+        COUNT=$(echo "$RESULT_JSON" | jq '[.dependencies[]?.vulns[]?.id] | unique | length')
+
+        echo "vulnerability-count=$COUNT" >> "$GITHUB_OUTPUT"
+        echo "result=$RESULT_JSON" >> "$GITHUB_OUTPUT"
+
+        {
+          echo "### audit-python — \`$WORKING_DIR\`"
+          echo ""
+          echo "Vulnerabilities found: **$COUNT**"
+          if [ "$COUNT" -gt 0 ]; then
+            echo ""
+            echo "| Package | Vulnerability | Fix versions |"
+            echo "|---|---|---|"
+            echo "$RESULT_JSON" | jq -r '
+              .dependencies[]? as $d
+              | ($d.vulns // [] | unique_by(.id))[]
+              | "| \($d.name) \($d.version) | \(.id) | \(.fix_versions | join(", ")) |"
+            '
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        if [ "$FAIL_ON_FINDINGS" = "true" ] && [ "$COUNT" -gt 0 ]; then
+          echo "::error::fail-on-findings is enabled and $COUNT vulnerabilities were found in $WORKING_DIR."
+          exit 1
+        fi
+
+        echo "Found $COUNT vulnerabilities — fail-on-findings=$FAIL_ON_FINDINGS, not failing this step."

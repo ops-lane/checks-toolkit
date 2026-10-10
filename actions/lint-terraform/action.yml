@@ -1,0 +1,78 @@
+name: "Lint Terraform"
+description: "Checks Terraform formatting with terraform fmt -check for the *.tf files directly in working-directory. Fails the step when a file is not formatted; the offending files and a diff are written to the job summary. terraform validate is not implemented yet."
+
+inputs:
+  working-directory:
+    description: "Directory whose *.tf files are checked — one component's path from detect-changes' components[] in a monorepo. Not recursive: nested directories are their own components. Defaults to the repo root."
+    required: false
+    default: "."
+  terraform-version:
+    description: "Exact Terraform CLI version to install. Pinned (not 'latest') so a new release cannot change the result of an unchanged PR."
+    required: false
+    default: "1.16.5"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install Terraform
+      # Official HashiCorp action; it only downloads the CLI. The wrapper is
+      # off so `terraform` behaves like the plain binary (exit codes and
+      # stdout reach the shell as-is).
+      uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+      with:
+        terraform_version: ${{ inputs.terraform-version }}
+        terraform_wrapper: false
+
+    - name: terraform fmt
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        WORKING_DIR: ${{ inputs.working-directory }}
+      run: |
+        # fmt works on syntax alone: no init, no providers, no network, no
+        # credentials. Without -recursive it only looks at this directory,
+        # matching how detect-changes defines a component.
+        # -check exits 3 when a file would change (and 0 when none would);
+        # any other non-zero code means fmt itself failed (e.g. a syntax
+        # error in a .tf file).
+        set +e
+        terraform fmt -check -diff -no-color > "$RUNNER_TEMP/fmt.txt" 2> "$RUNNER_TEMP/fmt.err"
+        exit_code=$?
+        set -e
+
+        if [ "$exit_code" -ne 0 ] && [ "$exit_code" -ne 3 ]; then
+          echo "::error::terraform fmt failed to run (exit code $exit_code)"
+          cat "$RUNNER_TEMP/fmt.err"
+          {
+            echo "### lint-terraform / fmt — \`$WORKING_DIR\`"
+            echo ""
+            echo "terraform fmt could not process the files:"
+            echo ""
+            echo '```text'
+            cat "$RUNNER_TEMP/fmt.err"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$exit_code"
+        fi
+
+        # With -check, fmt prints one file name per unformatted file; -diff
+        # adds the diff after it. File names are the lines that end in .tf
+        # and start without a diff marker.
+        FILES=$(grep -E '^[^ +@-].*\.tf$' "$RUNNER_TEMP/fmt.txt" || true)
+        if [ -z "$FILES" ]; then COUNT=0; else COUNT=$(echo "$FILES" | wc -l); fi
+
+        {
+          echo "### lint-terraform / fmt — \`$WORKING_DIR\`"
+          echo ""
+          echo "Unformatted files: **$COUNT**"
+          if [ "$COUNT" -gt 0 ]; then
+            echo ""
+            echo "Run \`terraform fmt\` in this directory to fix them."
+            echo ""
+            echo '```diff'
+            cat "$RUNNER_TEMP/fmt.txt"
+            echo '```'
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        exit "$exit_code"

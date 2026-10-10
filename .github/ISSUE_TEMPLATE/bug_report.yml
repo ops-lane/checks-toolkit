@@ -1,0 +1,41 @@
+name: Bug report
+description: Something does not work as documented
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Security problems:** do not report them here, this issue is public.
+        Follow the instructions in SECURITY.md in the repository instead.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The tag you call (`@v0.1.0`) or the commit
+    validations:
+      required: true
+  - type: dropdown
+    id: where
+    attributes:
+      label: Where does it happen?
+      options:
+        - ci.yml
+        - security.yml
+        - detect-changes
+        - ci-gate
+        - A specific action (name it below)
+        - Documentation
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+      description: Include a link to the failing run, or the relevant part of its job summary.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: How can it be reproduced?
+      description: A minimal repository layout or pull request is ideal.

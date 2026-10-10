@@ -1,0 +1,87 @@
+name: "Typecheck Python"
+description: "Type-checks Python code with mypy. Fails the step when mypy finds a type error; the errors are also written to the job summary. The project's own mypy configuration (mypy.ini, pyproject.toml, setup.cfg) is respected. Skips when the directory has no Python files (for example a dependency manifest only)."
+
+inputs:
+  working-directory:
+    description: "Directory to run mypy in — one component's path from detect-changes' components[] in a monorepo. Defaults to the repo root."
+    required: false
+    default: "."
+  ignore-missing-imports:
+    description: "Pass --ignore-missing-imports to mypy. Default is true: the project's own dependencies are deliberately NOT installed (installing them would run the pull request's own setup code), so mypy cannot resolve third-party imports and would report every one of them as an error. Set to false only if the project vendors everything or has its own stubs."
+    required: false
+    default: "true"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Run mypy
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        WORKING_DIR: ${{ inputs.working-directory }}
+        IGNORE_MISSING_IMPORTS: ${{ inputs.ignore-missing-imports }}
+      run: |
+        # A Python component can be a dependency manifest only (a
+        # pyproject.toml, requirements.txt or Pipfile with no code next to
+        # it). mypy refuses to run without any .py/.pyi file (exit code 2),
+        # which is not a type error, so there is nothing to check here.
+        # Virtual environments and installed packages are not the project's
+        # own code and do not count.
+        if [ -z "$(find . \( -name .venv -o -name venv -o -name node_modules -o -name .git \) -prune -o \( -name '*.py' -o -name '*.pyi' \) -print -quit)" ]; then
+          echo "::notice::No Python files in $WORKING_DIR - skipping typecheck-python."
+          {
+            echo "### typecheck-python — \`$WORKING_DIR\`"
+            echo ""
+            echo "**Skipped:** no \`.py\` or \`.pyi\` files in this directory (a dependency manifest only)."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+        fi
+
+        # Pinned (not "latest") so a new mypy release cannot change the
+        # result of an unchanged pull request. Bump deliberately.
+        pip install --no-cache-dir --break-system-packages --ignore-installed mypy==2.4.0
+
+        args=(--show-error-codes --no-error-summary --no-color-output --no-pretty)
+        if [ "$IGNORE_MISSING_IMPORTS" = "true" ]; then
+          args+=(--ignore-missing-imports)
+        fi
+
+        # mypy exits 0 (clean), 1 (type errors found) or 2 (it could not
+        # run at all, e.g. a broken config file). Only 1 is a finding.
+        set +e
+        mypy "${args[@]}" . > "$RUNNER_TEMP/mypy.txt" 2> "$RUNNER_TEMP/mypy.err"
+        exit_code=$?
+        set -e
+
+        if [ "$exit_code" -gt 1 ]; then
+          echo "::error::mypy failed to run (exit code $exit_code)"
+          cat "$RUNNER_TEMP/mypy.err" "$RUNNER_TEMP/mypy.txt"
+          {
+            echo "### typecheck-python — \`$WORKING_DIR\`"
+            echo ""
+            echo "mypy could not run:"
+            echo ""
+            echo '```text'
+            cat "$RUNNER_TEMP/mypy.err" "$RUNNER_TEMP/mypy.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$exit_code"
+        fi
+
+        # One finding per "path:line: error: ..." line; "note:" lines are
+        # continuation text of an error, not separate findings.
+        COUNT=$(grep -c ': error: ' "$RUNNER_TEMP/mypy.txt" || true)
+
+        {
+          echo "### typecheck-python — \`$WORKING_DIR\`"
+          echo ""
+          echo "Type errors found: **$COUNT**"
+          if [ "$COUNT" -gt 0 ]; then
+            echo ""
+            echo '```text'
+            cat "$RUNNER_TEMP/mypy.txt"
+            echo '```'
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        exit "$exit_code"

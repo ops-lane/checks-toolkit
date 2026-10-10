@@ -1,0 +1,55 @@
+name: Check workflows
+
+# Checks this repo's own workflows and actions. Deliberately independent of
+# ci.yml: if ci.yml itself is broken it cannot report that about itself, so
+# the checker must not depend on the thing it checks. It therefore does not
+# use detect-changes either; the path filter below decides when it runs.
+on:
+  pull_request:
+    branches: [development]
+    paths:
+      - ".github/workflows/**"
+      - ".github/dependabot.yml"
+      - "actions/**/action.yml"
+  push:
+    branches: [development]
+    paths:
+      - ".github/workflows/**"
+      - ".github/dependabot.yml"
+      - "actions/**/action.yml"
+  workflow_dispatch:
+    inputs:
+      fail-on-findings:
+        description: "Fail the zizmor scan when it reports findings"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  lint-workflows:
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: lint-workflows
+        uses: ./actions/lint-workflows
+
+  scan-workflows:
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: scan-workflows
+        uses: ./actions/scan-workflows
+        with:
+          paths: ".github actions"
+          fail-on-findings: ${{ inputs.fail-on-findings || false }}

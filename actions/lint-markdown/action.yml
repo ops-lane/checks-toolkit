@@ -1,0 +1,174 @@
+name: "Lint Markdown"
+description: "Checks the Markdown files of one component (the *.md files directly in working-directory) in three independent steps: structure/style with markdownlint-cli2, spelling with codespell, and broken links with lychee. markdownlint and codespell fail the step; broken links are reported and only fail the step if fail-on-broken-links is enabled. Findings are written to the job summary."
+
+inputs:
+  working-directory:
+    description: "Directory whose *.md files are checked — one component's path from detect-changes' components[] in a monorepo. Not recursive: nested directories are their own components. Defaults to the repo root."
+    required: false
+    default: "."
+  fail-on-broken-links:
+    description: "Fail this step when lychee finds broken links. Default is false (report only) — link checks depend on third-party sites being up, so they are the one check here that can fail for reasons that have nothing to do with the change."
+    required: false
+    default: "false"
+
+outputs:
+  broken-link-count:
+    description: "Number of broken links lychee found (0 if none)"
+    value: ${{ steps.links.outputs.broken-link-count }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: markdownlint
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        WORKING_DIR: ${{ inputs.working-directory }}
+        # Base configuration shipped with the platform. A config committed
+        # next to the files (or in a parent directory) wins over it.
+        BASE_CONFIG: ${{ github.action_path }}/markdownlint.jsonc
+      run: |
+        # "." is mapped by markdownlint-cli2 to *.{md,markdown} in this
+        # directory only, matching how detect-changes defines a component.
+        set +e
+        npx --yes markdownlint-cli2@0.23.3 . --config "$BASE_CONFIG" > "$RUNNER_TEMP/markdownlint.txt" 2>&1
+        exit_code=$?
+        set -e
+
+        COUNT=$(grep -c ' error MD' "$RUNNER_TEMP/markdownlint.txt" || true)
+
+        {
+          echo "### lint-markdown / markdownlint — \`$WORKING_DIR\`"
+          echo ""
+          echo "Issues found: **$COUNT**"
+          if [ "$COUNT" -gt 0 ]; then
+            echo ""
+            echo '```text'
+            grep ' error MD' "$RUNNER_TEMP/markdownlint.txt"
+            echo '```'
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        # Not just COUNT: a crash (bad config, npx failure) exits non-zero
+        # without any "error MD" lines and must not pass silently.
+        if [ "$exit_code" -ne 0 ] && [ "$COUNT" -eq 0 ]; then
+          cat "$RUNNER_TEMP/markdownlint.txt"
+        fi
+        exit "$exit_code"
+
+    - name: codespell
+      if: ${{ !cancelled() }}
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        WORKING_DIR: ${{ inputs.working-directory }}
+      run: |
+        pip install --no-cache-dir --break-system-packages --ignore-installed codespell==2.4.3
+
+        # --builtin clear: only unambiguous misspellings. The default also
+        # includes the "rare" list, which flags valid words.
+        # Files are passed explicitly (./*.md) so only this component is
+        # checked; codespell would otherwise recurse into subdirectories.
+        # A .codespellrc in the working directory (skip, ignore-words-list)
+        # is read automatically — paths in `skip` must be written as
+        # ./name.md because that is how the files are passed in here.
+        shopt -s nullglob
+        files=(./*.md)
+
+        set +e
+        codespell --builtin clear "${files[@]}" > "$RUNNER_TEMP/codespell.txt" 2>&1
+        exit_code=$?
+        set -e
+
+        COUNT=$(wc -l < "$RUNNER_TEMP/codespell.txt")
+
+        {
+          echo "### lint-markdown / codespell — \`$WORKING_DIR\`"
+          echo ""
+          echo "Misspellings found: **$COUNT**"
+          if [ "$COUNT" -gt 0 ]; then
+            echo ""
+            echo '```text'
+            cat "$RUNNER_TEMP/codespell.txt"
+            echo '```'
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        exit "$exit_code"
+
+    - name: Check links
+      id: links
+      if: ${{ !cancelled() }}
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        WORKING_DIR: ${{ inputs.working-directory }}
+        FAIL_ON_BROKEN_LINKS: ${{ inputs.fail-on-broken-links }}
+        # Pinned by version AND digest: a tag can be re-pointed, a digest
+        # cannot. Bump both together.
+        LYCHEE_IMAGE: lycheeverse/lychee:0.24.2@sha256:e2d19e57cf6ab037026f20b8e449a1f30d9d7f81eef4194763aab2eab20bd28d
+      run: |
+        shopt -s nullglob
+        files=(./*.md)
+
+        # The links come from the (possibly untrusted) PR, so lychee runs in
+        # a throwaway container: read-only mount of the files, no
+        # capabilities, and no secrets or tokens passed in. Private,
+        # loopback and link-local addresses are excluded so a link cannot
+        # make the runner probe its own network or the cloud metadata
+        # endpoint (169.254.169.254).
+        # 429 (rate limited) counts as OK: GitHub and others rate-limit
+        # anonymous requests, and that says nothing about the link.
+        set +e
+        docker run --rm \
+          --cap-drop ALL \
+          --security-opt no-new-privileges \
+          --volume "$PWD":/input:ro \
+          --workdir /input \
+          "$LYCHEE_IMAGE" \
+          --no-progress \
+          --format json \
+          --root-dir /input \
+          --exclude-all-private \
+          --timeout 20 \
+          --max-retries 2 \
+          --accept '100..=399,429' \
+          -- "${files[@]}" > "$RUNNER_TEMP/lychee.json" 2> "$RUNNER_TEMP/lychee.err"
+        exit_code=$?
+        set -e
+
+        # lychee's exit code can't separate "found broken links" from "could
+        # not run" (a bad flag and a broken link both exit 2), so success is
+        # judged on the output instead: a valid JSON report means lychee ran.
+        if ! jq -e . "$RUNNER_TEMP/lychee.json" > /dev/null 2>&1; then
+          echo "::error::lychee failed to run (exit code $exit_code)"
+          cat "$RUNNER_TEMP/lychee.err"
+          exit 1
+        fi
+
+        # Timeouts count as broken: the link did not answer in time, even
+        # after retries.
+        jq -r '[.error_map, .timeout_map | to_entries[] | .key as $file | .value[] | {file: $file, url: .url, text: .status.text}]' \
+          "$RUNNER_TEMP/lychee.json" > "$RUNNER_TEMP/lychee-broken.json"
+        COUNT=$(jq 'length' "$RUNNER_TEMP/lychee-broken.json")
+        echo "broken-link-count=$COUNT" >> "$GITHUB_OUTPUT"
+
+        {
+          echo "### lint-markdown / links — \`$WORKING_DIR\`"
+          echo ""
+          echo "Broken links: **$COUNT**"
+          if [ "$COUNT" -gt 0 ]; then
+            echo ""
+            echo "| File | Link | Status |"
+            echo "|---|---|---|"
+            jq -r '.[] | "| \(.file) | \(.url) | \(.text) |"' "$RUNNER_TEMP/lychee-broken.json"
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        if [ "$COUNT" -gt 0 ]; then
+          if [ "$FAIL_ON_BROKEN_LINKS" = "true" ]; then
+            echo "::error::$COUNT broken link(s) found in $WORKING_DIR"
+            exit 1
+          fi
+          echo "::warning::$COUNT broken link(s) found in $WORKING_DIR (report only; fail-on-broken-links is off)"
+        fi

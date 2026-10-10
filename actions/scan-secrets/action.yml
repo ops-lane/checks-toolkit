@@ -1,0 +1,125 @@
+name: "Scan Secrets"
+description: "Scans git history for leaked secrets (API keys, tokens, private keys) with Gitleaks. With base-ref and head-ref it scans exactly the commits of a pull request or push - including a secret that was added and removed again within it; without them it scans the whole history. Fails the step when anything is found. Secret values are redacted in every output. The repository must be checked out with full history (fetch-depth: 0)."
+
+inputs:
+  base-ref:
+    description: "Commit SHA to scan from (exclusive). With head-ref, limits the scan to base-ref..head-ref. Leave empty to scan the full history. The full history is also scanned when the range cannot select commits: an all-zero SHA (new branch), a base that is not a commit, or base equal to head."
+    required: false
+    default: ""
+  head-ref:
+    description: "Commit SHA to scan up to (inclusive). Leave empty to scan the full history."
+    required: false
+    default: ""
+  fail-on-findings:
+    description: "Fail this step when a secret is found. Default is true: a leaked secret is the one finding that must always block, and Gitleaks has no severity levels to threshold on. Set to false to only report."
+    required: false
+    default: "true"
+
+outputs:
+  finding-count:
+    description: "Number of leaks found (0 if none)"
+    value: ${{ steps.scan.outputs.finding-count }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Scan for secrets
+      id: scan
+      shell: bash
+      env:
+        BASE_REF: ${{ inputs.base-ref }}
+        HEAD_REF: ${{ inputs.head-ref }}
+        FAIL_ON_FINDINGS: ${{ inputs.fail-on-findings }}
+        # The platform's own configuration, shipped next to this action. See
+        # the comments in gitleaks.toml for why the repository's own
+        # .gitleaks.toml is deliberately not used.
+        CONFIG_FILE: ${{ github.action_path }}/gitleaks.toml
+        # Official Gitleaks image, pinned by version AND digest: a tag can be
+        # re-pointed, a digest cannot. Bump both together. Used instead of
+        # the gitleaks-action, which needs a paid license key for
+        # organization-owned repositories.
+        GITLEAKS_IMAGE: ghcr.io/gitleaks/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
+      run: |
+        ZERO=0000000000000000000000000000000000000000
+        args=(git /repo
+              --config /config/gitleaks.toml
+              # Without this, Gitleaks would read a .gitleaksignore from the
+              # scanned repo - another file a pull request could edit to
+              # hide its own finding. This path does not exist, so no
+              # ignore file is applied.
+              --gitleaks-ignore-path /nonexistent
+              --redact --report-format json --report-path -
+              --no-banner --log-level error
+              # Exit 2 means "leaks found". Gitleaks exits 1 when it fails
+              # to run, so the two cannot be confused.
+              --exit-code 2)
+
+        # A range is only used when it can really select commits. An
+        # all-zero base (new branch), a base that is not a commit (the empty
+        # tree detect-changes falls back to) or base == head (a manual run
+        # has no diff) would scan nothing or fail, and a secret scan that
+        # silently checks nothing is worse than one that checks too much.
+        if [ -n "$BASE_REF" ] && [ -n "$HEAD_REF" ] && [ "$BASE_REF" != "$ZERO" ] \
+           && [ "$BASE_REF" != "$HEAD_REF" ] \
+           && [ "$(git cat-file -t "$BASE_REF" 2>/dev/null)" = "commit" ]; then
+          echo "Scanning commits $BASE_REF..$HEAD_REF"
+          args+=(--log-opts="$BASE_REF..$HEAD_REF")
+          SCOPE="commits \`${BASE_REF:0:7}..${HEAD_REF:0:7}\`"
+        else
+          echo "Scanning the full history"
+          SCOPE="the full history"
+        fi
+
+        # Read-only mount of the repo, no capabilities, own user. git refuses
+        # to read a directory owned by another user unless it is marked safe;
+        # that is set through the environment so no config file is written.
+        set +e
+        docker run --rm \
+          --cap-drop ALL \
+          --security-opt no-new-privileges \
+          --user "$(id -u):$(id -g)" \
+          --env HOME=/tmp \
+          --env GIT_CONFIG_COUNT=1 --env GIT_CONFIG_KEY_0=safe.directory --env GIT_CONFIG_VALUE_0=/repo \
+          --volume "$PWD":/repo:ro \
+          --volume "$CONFIG_FILE":/config/gitleaks.toml:ro \
+          "$GITLEAKS_IMAGE" "${args[@]}" > "$RUNNER_TEMP/gitleaks.json" 2> "$RUNNER_TEMP/gitleaks.err"
+        exit_code=$?
+        set -e
+
+        if [ "$exit_code" -ne 0 ] && [ "$exit_code" -ne 2 ]; then
+          echo "::error::Gitleaks failed to run (exit code $exit_code) - this is a tool/execution error, not a finding. Is the repository checked out with fetch-depth: 0?"
+          cat "$RUNNER_TEMP/gitleaks.err"
+          exit 1
+        fi
+        if ! jq -e 'type == "array"' "$RUNNER_TEMP/gitleaks.json" > /dev/null 2>&1; then
+          echo "::error::Gitleaks produced no valid report."
+          cat "$RUNNER_TEMP/gitleaks.err"
+          exit 1
+        fi
+
+        COUNT=$(jq 'length' "$RUNNER_TEMP/gitleaks.json")
+        echo "finding-count=$COUNT" >> "$GITHUB_OUTPUT"
+
+        {
+          echo "### scan-secrets"
+          echo ""
+          echo "Scanned $SCOPE. Leaks found: **$COUNT**"
+          if [ "$COUNT" -gt 0 ]; then
+            echo ""
+            echo "| File | Rule | Commit |"
+            echo "|---|---|---|"
+            # The secret itself is redacted by Gitleaks and is not printed.
+            jq -r '.[:100][] | "| \(.File):\(.StartLine) | \(.RuleID) | \(.Commit[:7]) |"' "$RUNNER_TEMP/gitleaks.json"
+            echo ""
+            echo "_A secret that was committed must be treated as compromised: revoke and rotate it. Removing it in a later commit does not remove it from history._"
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        if [ "$COUNT" -gt 0 ]; then
+          jq -r '.[] | "::error file=\(.File),line=\(.StartLine)::Possible secret (\(.RuleID)) in commit \(.Commit[:7])"' "$RUNNER_TEMP/gitleaks.json" | head -n 20
+          if [ "$FAIL_ON_FINDINGS" = "true" ]; then
+            echo "::error::$COUNT possible secret(s) found."
+            exit 1
+          fi
+          echo "::warning::$COUNT possible secret(s) found (report only; fail-on-findings is off)."
+        fi

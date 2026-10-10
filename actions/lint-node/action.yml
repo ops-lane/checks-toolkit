@@ -1,0 +1,105 @@
+name: "Lint Node"
+description: "Lints Node code with the project's own ESLint. Installs the project's dependencies WITHOUT running lifecycle scripts, then runs the project's ESLint and its configuration. Fails the step on ESLint errors (warnings are only reported); findings are written to the job summary. Skips with a warning when the project has no ESLint."
+
+inputs:
+  working-directory:
+    description: "Directory to run ESLint in — one component's path from detect-changes' components[] in a monorepo. Defaults to the repo root."
+    required: false
+    default: "."
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install dependencies
+      id: install
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        # The project's own ESLint (and plugins) are used, so the project's
+        # dependencies have to be installed. --ignore-scripts is the
+        # important flag: lifecycle scripts (postinstall etc.) are code from
+        # the pull request, and linting does not need them.
+        # Another step in the same job may already have installed them.
+        if [ -d node_modules ]; then
+          echo "node_modules already present - not installing again."
+          echo "manager=existing" >> "$GITHUB_OUTPUT"
+        elif [ -f pnpm-lock.yaml ]; then
+          echo "manager=pnpm" >> "$GITHUB_OUTPUT"
+          # npx instead of a global install: no root needed, version pinned.
+          npx --yes pnpm@10.34.6 install --frozen-lockfile --ignore-scripts
+        elif [ -f yarn.lock ]; then
+          echo "::warning::yarn is not supported yet - dependencies are not installed."
+          echo "manager=yarn" >> "$GITHUB_OUTPUT"
+        elif [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+          echo "manager=npm" >> "$GITHUB_OUTPUT"
+          npm ci --ignore-scripts --no-audit --no-fund
+        else
+          echo "::warning::No lockfile found - installing without one, so versions are not reproducible."
+          echo "manager=npm" >> "$GITHUB_OUTPUT"
+          npm install --ignore-scripts --no-audit --no-fund
+        fi
+
+    - name: Run ESLint
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        WORKING_DIR: ${{ inputs.working-directory }}
+      run: |
+        ESLINT=node_modules/.bin/eslint
+        if [ ! -x "$ESLINT" ]; then
+          echo "::warning::ESLint is not installed by this project - skipping lint-node in $WORKING_DIR."
+          {
+            echo "### lint-node — \`$WORKING_DIR\`"
+            echo ""
+            echo "**Skipped:** ESLint is not a dependency of this project (or its dependencies could not be installed)."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+        fi
+
+        # ESLint exits 0 (clean), 1 (lint errors) or 2 (it could not run,
+        # e.g. no configuration file). Only 1 is a finding.
+        set +e
+        "$ESLINT" . --format json > "$RUNNER_TEMP/eslint.json" 2> "$RUNNER_TEMP/eslint.err"
+        exit_code=$?
+        set -e
+
+        if [ "$exit_code" -gt 1 ] || ! jq -e . "$RUNNER_TEMP/eslint.json" > /dev/null 2>&1; then
+          echo "::error::ESLint failed to run (exit code $exit_code)"
+          cat "$RUNNER_TEMP/eslint.err"
+          {
+            echo "### lint-node — \`$WORKING_DIR\`"
+            echo ""
+            echo "ESLint could not run:"
+            echo ""
+            echo '```text'
+            cat "$RUNNER_TEMP/eslint.err"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+        fi
+
+        ERRORS=$(jq '[.[].errorCount] | add // 0' "$RUNNER_TEMP/eslint.json")
+        WARNINGS=$(jq '[.[].warningCount] | add // 0' "$RUNNER_TEMP/eslint.json")
+
+        {
+          echo "### lint-node — \`$WORKING_DIR\`"
+          echo ""
+          echo "Errors: **$ERRORS** · Warnings: **$WARNINGS** (warnings do not fail the step)"
+          if [ "$ERRORS" -gt 0 ]; then
+            echo ""
+            echo "| File | Rule | Message |"
+            echo "|---|---|---|"
+            # Errors only, capped so a huge result cannot exceed the size
+            # limit of a job summary.
+            jq -r --arg cwd "$PWD/" '
+              [.[] | .filePath as $f | .messages[] | select(.severity == 2)
+               | "| \($f | ltrimstr($cwd)):\(.line) | \(.ruleId // "-") | \(.message | gsub("\\|"; "\\|")) |"]
+              | .[:100][]' "$RUNNER_TEMP/eslint.json"
+            [ "$ERRORS" -le 100 ] || echo "| ... | | $((ERRORS - 100)) more not shown |"
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        if [ "$ERRORS" -gt 0 ]; then
+          echo "::error::ESLint found $ERRORS error(s) in $WORKING_DIR"
+          exit 1
+        fi

@@ -1,0 +1,81 @@
+name: "Lint Workflows"
+description: "Checks the GitHub Actions workflow files in .github/workflows with actionlint (syntax, expression types, needs/matrix/inputs references, shell in run blocks when shellcheck is available). Fails the step on any finding; findings are written to the job summary."
+
+inputs:
+  actionlint-version:
+    description: "Exact actionlint version to install (without a leading v). Pinned (not 'latest') so a new release cannot change the result of an unchanged PR. Must be changed together with actionlint-sha256."
+    required: false
+    default: "1.7.12"
+  actionlint-sha256:
+    description: "SHA-256 of the linux_amd64 release tarball for actionlint-version. The download is rejected when it does not match, so a tampered release asset cannot run."
+    required: false
+    default: "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install actionlint
+      shell: bash
+      env:
+        VERSION: ${{ inputs.actionlint-version }}
+        SHA256: ${{ inputs.actionlint-sha256 }}
+      run: |
+        # Plain release download instead of a third-party Action. The hash
+        # below is checked before anything is extracted or executed.
+        set -euo pipefail
+        url="https://github.com/rhysd/actionlint/releases/download/v${VERSION}/actionlint_${VERSION}_linux_amd64.tar.gz"
+        curl -sSfL --retry 3 -o "$RUNNER_TEMP/actionlint.tar.gz" "$url"
+        echo "${SHA256}  $RUNNER_TEMP/actionlint.tar.gz" | sha256sum -c -
+        tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$RUNNER_TEMP" actionlint
+
+    - name: actionlint
+      shell: bash
+      run: |
+        # Files are passed explicitly: only this repo's own workflows, never
+        # the platform checkout that ci.yml places in .checks-toolkit/.
+        # Not recursive; GitHub only runs workflows directly in this folder.
+        mapfile -t FILES < <(find .github/workflows -maxdepth 1 -type f \( -name '*.yml' -o -name '*.yaml' \) 2>/dev/null | sort)
+
+        if [ "${#FILES[@]}" -eq 0 ]; then
+          {
+            echo "### lint-workflows / actionlint"
+            echo ""
+            echo "No workflow files found in \`.github/workflows\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+        fi
+
+        # Exit codes: 0 = clean, 1 = findings, anything else = actionlint
+        # itself failed (bad flags, unreadable file) and must not pass.
+        # actionlint also runs the shell linter on `run:` blocks when that is
+        # in PATH (preinstalled on GitHub-hosted Ubuntu runners).
+        set +e
+        "$RUNNER_TEMP/actionlint" -no-color -format '{{json .}}' "${FILES[@]}" > "$RUNNER_TEMP/actionlint.json" 2> "$RUNNER_TEMP/actionlint.err"
+        exit_code=$?
+        set -e
+
+        if [ "$exit_code" -gt 1 ]; then
+          echo "::error::actionlint failed to run (exit code $exit_code)"
+          cat "$RUNNER_TEMP/actionlint.err"
+          exit "$exit_code"
+        fi
+
+        # With no findings actionlint prints `null`.
+        COUNT=$(jq 'length // 0' "$RUNNER_TEMP/actionlint.json")
+
+        {
+          echo "### lint-workflows / actionlint"
+          echo ""
+          echo "Files checked: **${#FILES[@]}** — findings: **$COUNT**"
+          if [ "$COUNT" -gt 0 ]; then
+            echo ""
+            echo "| File | Line | Kind | Message |"
+            echo "|---|---|---|---|"
+            jq -r '.[] | "| `\(.filepath)` | \(.line) | \(.kind) | \(.message | gsub("\n"; " ") | gsub("\\|"; "\\|")) |"' "$RUNNER_TEMP/actionlint.json"
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        if [ "$COUNT" -gt 0 ]; then
+          echo "::error::actionlint found $COUNT problem(s) in the workflow files"
+          exit 1
+        fi

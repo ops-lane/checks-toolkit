@@ -1,0 +1,9 @@
+rules:
+  # zizmor wants `$/actions/...` instead of `./actions/...` for actions in the
+  # same repository. Not adopted yet: `ci.yml` calls the platform actions
+  # through a separate checkout (`./.checks-toolkit/...`) so they also work
+  # when a consumer repo calls the workflow, and it is unverified whether
+  # `$/` behaves the same there. Revisit with an experiment in
+  # checks-toolkit-test.
+  self-repository:
+    disable: true

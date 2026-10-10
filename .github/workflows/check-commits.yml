@@ -1,0 +1,29 @@
+name: Check commits
+
+# The release notes are generated from commit subjects (git-cliff), so every
+# commit in a pull request has to follow Conventional Commits. Deliberately
+# separate from ci.yml, like check-workflows.yml: it checks this repository's
+# own contribution rules, not a consumer's code.
+on:
+  pull_request:
+    branches: [development]
+
+permissions:
+  contents: read
+
+jobs:
+  lint-commits:
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # The commits of the pull request have to be present.
+          fetch-depth: 0
+
+      - name: lint-commits
+        uses: ./actions/lint-commits
+        with:
+          base-ref: ${{ github.event.pull_request.base.sha }}
+          head-ref: ${{ github.event.pull_request.head.sha }}

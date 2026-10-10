@@ -1,0 +1,275 @@
+name: "Scan Code"
+description: "Static analysis (SAST) of the whole repository in one run: Semgrep for Python, JavaScript/TypeScript and Dockerfiles, and - when switched on with the codeql input - CodeQL for Python and JavaScript/TypeScript. Fails the step when a finding at or above fail-on-severity is found; every finding is written to the job summary. Results are not uploaded to GitHub code scanning unless upload-sarif is enabled."
+
+inputs:
+  python:
+    description: "Whether Python is present (detect-changes project.python). Enables the CodeQL Python analysis and Semgrep's Python rules."
+    required: false
+    default: "false"
+  node:
+    description: "Whether Node/TypeScript is present (detect-changes project.node). Enables the CodeQL JavaScript/TypeScript analysis and Semgrep's JavaScript/TypeScript rules."
+    required: false
+    default: "false"
+  docker:
+    description: "Whether Dockerfiles are present (detect-changes project.docker). Enables Semgrep's Dockerfile rules (CodeQL has no Dockerfile support)."
+    required: false
+    default: "false"
+  codeql:
+    description: "Also run CodeQL (Python and JavaScript/TypeScript). Default is false, so it has to be switched on deliberately: CodeQL only works on a public repository or one with GitHub Advanced Security, and on any other private repository it fails, which would fail this whole step. Turn it on once the repository is public or has Advanced Security. Semgrep always runs and is not affected."
+    required: false
+    default: "false"
+  fail-on-severity:
+    description: "Lowest severity that fails this step: critical, high, medium, low, or none (never fail, report only). Default is high. CodeQL severities come from its security-severity score; Semgrep ERROR counts as high, WARNING as medium and INFO as low (Semgrep has no critical)."
+    required: false
+    default: "high"
+  upload-sarif:
+    description: "Also upload CodeQL's results to GitHub code scanning, so they show up under the Security tab. Default is false: uploading needs security-events: write on the calling job, which a pull request from a fork never has, and a private repository needs GitHub Advanced Security. The results are gated and shown in the job summary either way."
+    required: false
+    default: "false"
+
+outputs:
+  result:
+    description: "Finding counts per severity, both tools combined, as JSON: {low, medium, high, critical, total}"
+    value: ${{ steps.decide.outputs.result }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Decide what to scan
+      id: prepare
+      shell: bash
+      env:
+        PYTHON: ${{ inputs.python }}
+        NODE: ${{ inputs.node }}
+        DOCKER: ${{ inputs.docker }}
+        CODEQL: ${{ inputs.codeql }}
+      run: |
+        # CodeQL names: "python" and "javascript-typescript" (one analysis
+        # covers both JavaScript and TypeScript).
+        codeql=()
+        [ "$PYTHON" = "true" ] && codeql+=("python")
+        [ "$NODE" = "true" ] && codeql+=("javascript-typescript")
+        languages=$(IFS=,; echo "${codeql[*]}")
+
+        # Semgrep rule sets from the public registry, one per language.
+        semgrep=()
+        [ "$PYTHON" = "true" ] && semgrep+=("p/python")
+        [ "$NODE" = "true" ] && semgrep+=("p/javascript" "p/typescript")
+        [ "$DOCKER" = "true" ] && semgrep+=("p/dockerfile")
+
+        # CodeQL only runs when there is something for it to analyze AND it
+        # was switched on. Switched off is said out loud, never silent.
+        if [ -n "$languages" ] && [ "$CODEQL" = "true" ]; then
+          run_codeql=true
+        else
+          run_codeql=false
+          if [ -n "$languages" ]; then
+            echo "::notice::CodeQL is off (input codeql is not true) - only Semgrep runs. Turn it on once the repository is public or has GitHub Advanced Security."
+          fi
+        fi
+
+        echo "run-codeql=$run_codeql" >> "$GITHUB_OUTPUT"
+        echo "codeql-languages=$languages" >> "$GITHUB_OUTPUT"
+        echo "run-semgrep=$([ ${#semgrep[@]} -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+        echo "semgrep-configs=${semgrep[*]}" >> "$GITHUB_OUTPUT"
+
+        if [ -z "$languages" ] && [ ${#semgrep[@]} -eq 0 ]; then
+          echo "::notice::No supported language present - nothing for scan-code to analyze."
+        fi
+
+    # ---- CodeQL ---------------------------------------------------------
+    # Pinned to a commit, not a tag: a tag can be moved, a commit cannot.
+    # Official GitHub action; bump deliberately (Dependabot can do it).
+    - name: Initialize CodeQL
+      if: ${{ steps.prepare.outputs.run-codeql == 'true' }}
+      uses: github/codeql-action/init@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+      with:
+        languages: ${{ steps.prepare.outputs.codeql-languages }}
+        # Python and JavaScript/TypeScript are interpreted: no build needed.
+        build-mode: none
+        # The platform's own checkout (ci.yml places it next to the caller's
+        # code) is not part of the repository being analyzed.
+        config: |
+          paths-ignore:
+            - .checks-toolkit
+
+    - name: Analyze with CodeQL
+      id: codeql
+      if: ${{ steps.prepare.outputs.run-codeql == 'true' }}
+      uses: github/codeql-action/analyze@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+      with:
+        category: "/checks-toolkit"
+        # Keep the results local: the verdict is decided below from the
+        # SARIF file, and uploading would need security-events: write.
+        upload: never
+        upload-database: false
+        output: ${{ runner.temp }}/codeql-sarif
+
+    - name: Upload CodeQL results to code scanning
+      if: ${{ steps.prepare.outputs.run-codeql == 'true' && inputs.upload-sarif == 'true' }}
+      uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+      with:
+        sarif_file: ${{ runner.temp }}/codeql-sarif
+        category: "/checks-toolkit"
+
+    - name: Read CodeQL results
+      id: codeql-results
+      if: ${{ steps.prepare.outputs.run-codeql == 'true' }}
+      shell: bash
+      run: |
+        shopt -s nullglob
+        files=("$RUNNER_TEMP"/codeql-sarif/*.sarif)
+        if [ ${#files[@]} -eq 0 ]; then
+          echo "::error::CodeQL produced no SARIF file - the analysis did not run."
+          exit 1
+        fi
+
+        # One flat list of findings across all languages, each with a
+        # severity bucket. CodeQL puts a numeric CVSS-like score
+        # (security-severity) on security rules: 9+ critical, 7+ high,
+        # 4+ medium, below that low. Rules without a score (code-quality
+        # rules) fall back to the SARIF level.
+        jq -c -s '
+          def bucket($score; $level):
+            if $score != null then
+              ($score | tonumber) as $n
+              | if $n >= 9 then "critical" elif $n >= 7 then "high" elif $n >= 4 then "medium" else "low" end
+            else
+              ({"error": "high", "warning": "medium", "note": "low"}[$level // "warning"] // "medium")
+            end;
+          [ .[].runs[]
+            | (.tool.driver.rules // []) as $rules
+            | .results[]?
+            | ((.ruleIndex // .rule.index) as $i | if $i == null then {} else ($rules[$i] // {}) end) as $rule
+            | { tool: "CodeQL",
+                rule: (.ruleId // .rule.id // "?"),
+                severity: bucket($rule.properties["security-severity"]; .level),
+                location: ((.locations[0].physicalLocation // {}) | "\(.artifactLocation.uri // "?"):\(.region.startLine // "?")"),
+                message: (.message.text // "" | .[:200]) } ]
+        ' "${files[@]}" > "$RUNNER_TEMP/codeql-findings.json"
+        echo "CodeQL findings: $(jq length "$RUNNER_TEMP/codeql-findings.json")"
+
+    # ---- Semgrep --------------------------------------------------------
+    - name: Run Semgrep
+      id: semgrep
+      if: ${{ steps.prepare.outputs.run-semgrep == 'true' }}
+      shell: bash
+      env:
+        CONFIGS: ${{ steps.prepare.outputs.semgrep-configs }}
+        # Official Semgrep image, pinned by version AND digest: a tag can be
+        # re-pointed, a digest cannot. Bump both together.
+        SEMGREP_IMAGE: semgrep/semgrep:1.179.0@sha256:93963d9295a366f59e4850127b1550400ee7b388f04fe144e4a1f6325d96e01b
+      run: |
+        args=()
+        for c in $CONFIGS; do args+=(--config "$c"); done
+
+        # The code is the (possibly untrusted) pull request's, so Semgrep
+        # runs in a throwaway container: read-only mount, no capabilities,
+        # own user, no tokens. --metrics=off: nothing is sent to Semgrep.
+        # It does need the network to fetch the public rule sets.
+        # Semgrep itself does not execute the code it analyzes.
+        set +e
+        docker run --rm \
+          --cap-drop ALL \
+          --security-opt no-new-privileges \
+          --user "$(id -u):$(id -g)" \
+          --env HOME=/tmp \
+          --volume "$PWD":/src:ro \
+          --workdir /src \
+          "$SEMGREP_IMAGE" \
+          semgrep scan "${args[@]}" \
+            --metrics=off --disable-version-check --quiet --json \
+            --exclude .checks-toolkit \
+          > "$RUNNER_TEMP/semgrep.json" 2> "$RUNNER_TEMP/semgrep.err"
+        exit_code=$?
+        set -e
+
+        if ! jq -e '.results' "$RUNNER_TEMP/semgrep.json" > /dev/null 2>&1; then
+          echo "::error::Semgrep failed to run (exit code $exit_code) - this is a tool/execution error, not a finding."
+          tail -n 30 "$RUNNER_TEMP/semgrep.err"
+          exit 1
+        fi
+
+        # Semgrep has three levels. It has no "critical", so its worst
+        # finding (ERROR) is mapped to high.
+        jq -c '[.results[] | {
+                 tool: "Semgrep",
+                 rule: (.check_id | split(".") | last),
+                 severity: ({"ERROR": "high", "WARNING": "medium", "INFO": "low"}[.extra.severity] // "medium"),
+                 location: "\(.path):\(.start.line)",
+                 message: (.extra.message | .[:200]) }]' "$RUNNER_TEMP/semgrep.json" > "$RUNNER_TEMP/semgrep-findings.json"
+        echo "Semgrep findings: $(jq length "$RUNNER_TEMP/semgrep-findings.json")"
+
+        # Rules that could not be parsed or files that could not be read
+        # are reported but do not fail the step.
+        ERRS=$(jq '.errors | length' "$RUNNER_TEMP/semgrep.json")
+        [ "$ERRS" -eq 0 ] || echo "::warning::Semgrep reported $ERRS non-fatal error(s) (e.g. a file it could not parse)."
+
+    # ---- Verdict --------------------------------------------------------
+    - name: Decide
+      id: decide
+      if: ${{ !cancelled() && (steps.prepare.outputs.run-codeql == 'true' || steps.prepare.outputs.run-semgrep == 'true') }}
+      shell: bash
+      env:
+        FAIL_ON_SEVERITY: ${{ inputs.fail-on-severity }}
+        LANGUAGES: ${{ steps.prepare.outputs.codeql-languages }}
+        RUN_CODEQL: ${{ steps.prepare.outputs.run-codeql }}
+        CONFIGS: ${{ steps.prepare.outputs.semgrep-configs }}
+      run: |
+        case "$FAIL_ON_SEVERITY" in
+          critical|high|medium|low|none) ;;
+          *) echo "::error::fail-on-severity must be critical, high, medium, low or none (got '$FAIL_ON_SEVERITY')"; exit 1 ;;
+        esac
+
+        # Whichever tool did not run simply contributes no findings.
+        [ -f "$RUNNER_TEMP/codeql-findings.json" ] || echo '[]' > "$RUNNER_TEMP/codeql-findings.json"
+        [ -f "$RUNNER_TEMP/semgrep-findings.json" ] || echo '[]' > "$RUNNER_TEMP/semgrep-findings.json"
+        jq -s 'add' "$RUNNER_TEMP/codeql-findings.json" "$RUNNER_TEMP/semgrep-findings.json" > "$RUNNER_TEMP/findings.json"
+
+        RESULT=$(jq -c '. as $f | {
+          low: ($f | map(select(.severity == "low")) | length),
+          medium: ($f | map(select(.severity == "medium")) | length),
+          high: ($f | map(select(.severity == "high")) | length),
+          critical: ($f | map(select(.severity == "critical")) | length),
+          total: ($f | length)}' "$RUNNER_TEMP/findings.json")
+        echo "result=$RESULT" >> "$GITHUB_OUTPUT"
+        TOTAL=$(echo "$RESULT" | jq .total)
+
+        BLOCKING=$(echo "$RESULT" | jq --arg t "$FAIL_ON_SEVERITY" '
+          ["critical","high","medium","low"] as $order
+          | if $t == "none" then 0
+            else ($order | index($t)) as $i | [$order[:$i + 1][] as $s | .[$s]] | add end')
+
+        {
+          echo "### scan-code"
+          echo ""
+          if [ "$RUN_CODEQL" = "true" ]; then codeql_state="$LANGUAGES"
+          elif [ -n "$LANGUAGES" ]; then codeql_state="**off** (input \`codeql\` is not true)"
+          else codeql_state="not run"; fi
+          echo "CodeQL: $codeql_state · Semgrep: ${CONFIGS:-not run}"
+          echo ""
+          echo "Findings: **$TOTAL** — critical $(echo "$RESULT" | jq .critical), high $(echo "$RESULT" | jq .high), medium $(echo "$RESULT" | jq .medium), low $(echo "$RESULT" | jq .low)"
+          if [ "$TOTAL" -gt 0 ]; then
+            echo ""
+            echo "| Tool | Severity | Location | Rule |"
+            echo "|---|---|---|---|"
+            jq -r '
+              {"critical":0,"high":1,"medium":2,"low":3} as $rank
+              | sort_by($rank[.severity])
+              | .[:100][]
+              | "| \(.tool) | \(.severity) | \(.location) | \(.rule) |"' "$RUNNER_TEMP/findings.json"
+            [ "$TOTAL" -le 100 ] || echo "| | | | $((TOTAL - 100)) more not shown |"
+          fi
+          echo ""
+          if [ "$FAIL_ON_SEVERITY" = "none" ]; then
+            echo "_Report only (fail-on-severity: none)._"
+          else
+            echo "_Fails on **$FAIL_ON_SEVERITY** and above: $BLOCKING finding(s) at or above that level._"
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        if [ "$BLOCKING" -gt 0 ]; then
+          echo "::error::$BLOCKING code finding(s) at '$FAIL_ON_SEVERITY' or above."
+          exit 1
+        fi
+        echo "$TOTAL finding(s), none at '$FAIL_ON_SEVERITY' or above."

@@ -1,0 +1,108 @@
+name: "Scan Terraform"
+description: "Scans Terraform files for security misconfigurations with Trivy (trivy config), for example a security group open to the whole internet. Reads the files only: no init, no providers, no credentials, no state. Fails the step when a finding at or above fail-on-severity is found; every finding is written to the job summary."
+
+inputs:
+  working-directory:
+    description: "Directory to scan — one component's path from detect-changes' components[] in a monorepo. Defaults to the repo root. Unlike lint-terraform this scans recursively, because Trivy needs the local modules a configuration refers to."
+    required: false
+    default: "."
+  fail-on-severity:
+    description: "Lowest severity that fails this step: critical, high, medium, low, or none (never fail, report only). Default is high, so critical and high block while medium and low are only reported."
+    required: false
+    default: "high"
+
+outputs:
+  result:
+    description: "Misconfiguration counts per severity as JSON: {unknown, low, medium, high, critical, total}"
+    value: ${{ steps.scan.outputs.result }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Scan Terraform
+      id: scan
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        WORKING_DIR: ${{ inputs.working-directory }}
+        FAIL_ON_SEVERITY: ${{ inputs.fail-on-severity }}
+        # Same pinned Trivy image as scan-docker - bump both together.
+        TRIVY_IMAGE: ghcr.io/aquasecurity/trivy:0.75.0@sha256:af6acf9a6b85dfe389a1941505c0ce9efef52a4719635e1a962f022a3d855daa
+      run: |
+        case "$FAIL_ON_SEVERITY" in
+          critical|high|medium|low|none) ;;
+          *) echo "::error::fail-on-severity must be critical, high, medium, low or none (got '$FAIL_ON_SEVERITY')"; exit 1 ;;
+        esac
+
+        # The Terraform files come from the (possibly untrusted) pull
+        # request, so Trivy runs in a throwaway container: files mounted
+        # read-only, no capabilities, no credentials, own user. Trivy only
+        # parses the files; it never runs Terraform.
+        # Misconfiguration checks ship with Trivy and are refreshed from a
+        # check bundle, so the container needs the network, but no
+        # credentials of any kind.
+        set +e
+        docker run --rm \
+          --cap-drop ALL \
+          --security-opt no-new-privileges \
+          --user "$(id -u):$(id -g)" \
+          --env HOME=/tmp --env TRIVY_CACHE_DIR=/tmp/trivy \
+          --volume "$PWD":/src:ro \
+          "$TRIVY_IMAGE" config /src \
+            --misconfig-scanners terraform \
+            --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL \
+            --format json --quiet \
+          > "$RUNNER_TEMP/trivy.json" 2> "$RUNNER_TEMP/trivy.err"
+        exit_code=$?
+        set -e
+
+        if [ "$exit_code" -ne 0 ] || ! jq -e '.SchemaVersion' "$RUNNER_TEMP/trivy.json" > /dev/null 2>&1; then
+          echo "::error::Trivy failed to run (exit code $exit_code) - this is a tool/execution error, not a finding."
+          tail -n 30 "$RUNNER_TEMP/trivy.err"
+          exit 1
+        fi
+
+        RESULT=$(jq -c '[.Results[]?.Misconfigurations[]?.Severity] as $s
+          | {unknown: ($s | map(select(. == "UNKNOWN")) | length),
+             low: ($s | map(select(. == "LOW")) | length),
+             medium: ($s | map(select(. == "MEDIUM")) | length),
+             high: ($s | map(select(. == "HIGH")) | length),
+             critical: ($s | map(select(. == "CRITICAL")) | length),
+             total: ($s | length)}' "$RUNNER_TEMP/trivy.json")
+        echo "result=$RESULT" >> "$GITHUB_OUTPUT"
+        TOTAL=$(echo "$RESULT" | jq .total)
+
+        BLOCKING=$(echo "$RESULT" | jq --arg t "$FAIL_ON_SEVERITY" '
+          ["critical","high","medium","low"] as $order
+          | if $t == "none" then 0
+            else ($order | index($t)) as $i | [$order[:$i + 1][] as $s | .[$s]] | add end')
+
+        {
+          echo "### scan-terraform — \`$WORKING_DIR\`"
+          echo ""
+          echo "Misconfigurations: **$TOTAL** — critical $(echo "$RESULT" | jq .critical), high $(echo "$RESULT" | jq .high), medium $(echo "$RESULT" | jq .medium), low $(echo "$RESULT" | jq .low)"
+          if [ "$TOTAL" -gt 0 ]; then
+            echo ""
+            echo "| File | Check | Severity | Problem |"
+            echo "|---|---|---|---|"
+            jq -r '
+              {"CRITICAL":0,"HIGH":1,"MEDIUM":2,"LOW":3,"UNKNOWN":4} as $rank
+              | [.Results[]? | .Target as $t | .Misconfigurations[]? | . + {target: $t}]
+              | sort_by($rank[.Severity])
+              | .[:100][]
+              | "| \(.target):\(.CauseMetadata.StartLine // "?") | \(.ID) | \(.Severity) | \(.Title | gsub("\\|"; "\\|")) |"' "$RUNNER_TEMP/trivy.json"
+            [ "$TOTAL" -le 100 ] || echo "| ... | | | $((TOTAL - 100)) more not shown |"
+          fi
+          echo ""
+          if [ "$FAIL_ON_SEVERITY" = "none" ]; then
+            echo "_Report only (fail-on-severity: none)._"
+          else
+            echo "_Fails on **$FAIL_ON_SEVERITY** and above: $BLOCKING finding(s) at or above that level._"
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        if [ "$BLOCKING" -gt 0 ]; then
+          echo "::error::$BLOCKING misconfiguration(s) at '$FAIL_ON_SEVERITY' or above in $WORKING_DIR"
+          exit 1
+        fi
+        echo "$TOTAL finding(s), none at '$FAIL_ON_SEVERITY' or above."

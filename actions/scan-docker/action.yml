@@ -1,0 +1,130 @@
+name: "Scan Docker"
+description: "Scans a built Docker image for known vulnerabilities with Trivy (OS packages and language dependencies inside the image). Fails the step when a vulnerability at or above fail-on-severity is found; every finding is written to the job summary. Skips with a notice when there is no image (build-docker built nothing)."
+
+inputs:
+  image:
+    description: "Tag of a local image to scan - the 'image' output of build-docker. Empty means 'nothing to scan' and the action skips."
+    required: true
+  fail-on-severity:
+    description: "Lowest severity that fails this step: critical, high, medium, low, or none (never fail, report only). Default is high, so critical and high block while medium and low are only reported."
+    required: false
+    default: "high"
+  ignore-unfixed:
+    description: "Ignore vulnerabilities that have no fixed version yet. Default is true: a finding nobody can fix by updating should not block a pull request. Set to false to see everything."
+    required: false
+    default: "true"
+
+outputs:
+  result:
+    description: "Vulnerability counts per severity as JSON: {unknown, low, medium, high, critical, total}"
+    value: ${{ steps.scan.outputs.result }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Scan image
+      id: scan
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.image }}
+        FAIL_ON_SEVERITY: ${{ inputs.fail-on-severity }}
+        IGNORE_UNFIXED: ${{ inputs.ignore-unfixed }}
+        # Trivy runs from its official image, pinned by version AND digest:
+        # a tag can be re-pointed, a digest cannot. Bump both together.
+        # Run as a container (not as a third-party Action) so there is no
+        # action code in between, and so it can be locked down below.
+        TRIVY_IMAGE: ghcr.io/aquasecurity/trivy:0.75.0@sha256:af6acf9a6b85dfe389a1941505c0ce9efef52a4719635e1a962f022a3d855daa
+      run: |
+        case "$FAIL_ON_SEVERITY" in
+          critical|high|medium|low|none) ;;
+          *) echo "::error::fail-on-severity must be critical, high, medium, low or none (got '$FAIL_ON_SEVERITY')"; exit 1 ;;
+        esac
+
+        if [ -z "$IMAGE" ]; then
+          echo "::notice::No image to scan - skipping scan-docker."
+          echo 'result={"unknown":0,"low":0,"medium":0,"high":0,"critical":0,"total":0}' >> "$GITHUB_OUTPUT"
+          {
+            echo "### scan-docker"
+            echo ""
+            echo "**Skipped:** no image was built."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+        fi
+
+        # The image goes to Trivy as a tar file on a read-only mount instead
+        # of handing the container the Docker socket: access to the socket
+        # is root on the runner, and Trivy parses untrusted image content.
+        docker save "$IMAGE" --output "$RUNNER_TEMP/image.tar"
+
+        args=(image --input /work/image.tar --scanners vuln --format json --quiet
+              --severity "UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL"
+              # The default database host rate-limits anonymous pulls; the
+              # second one is the official mirror Trivy documents for that.
+              --db-repository "ghcr.io/aquasecurity/trivy-db:2,public.ecr.aws/aquasecurity/trivy-db:2")
+        [ "$IGNORE_UNFIXED" = "true" ] && args+=(--ignore-unfixed)
+
+        # No capabilities, no privilege escalation, runs as the runner's own
+        # user, image tar read-only. It needs the network for its database.
+        set +e
+        docker run --rm \
+          --cap-drop ALL \
+          --security-opt no-new-privileges \
+          --user "$(id -u):$(id -g)" \
+          --env HOME=/tmp --env TRIVY_CACHE_DIR=/tmp/trivy \
+          --volume "$RUNNER_TEMP":/work:ro \
+          "$TRIVY_IMAGE" "${args[@]}" > "$RUNNER_TEMP/trivy.json" 2> "$RUNNER_TEMP/trivy.err"
+        exit_code=$?
+        set -e
+
+        # Success is judged on the output, not the exit code: a valid report
+        # (it always has a Results or SchemaVersion field) means Trivy ran.
+        if [ "$exit_code" -ne 0 ] || ! jq -e '.SchemaVersion' "$RUNNER_TEMP/trivy.json" > /dev/null 2>&1; then
+          echo "::error::Trivy failed to run (exit code $exit_code) - this is a tool/execution error, not a vulnerability finding."
+          tail -n 30 "$RUNNER_TEMP/trivy.err"
+          exit 1
+        fi
+
+        RESULT=$(jq -c '[.Results[]?.Vulnerabilities[]?.Severity] as $s
+          | {unknown: ($s | map(select(. == "UNKNOWN")) | length),
+             low: ($s | map(select(. == "LOW")) | length),
+             medium: ($s | map(select(. == "MEDIUM")) | length),
+             high: ($s | map(select(. == "HIGH")) | length),
+             critical: ($s | map(select(. == "CRITICAL")) | length),
+             total: ($s | length)}' "$RUNNER_TEMP/trivy.json")
+        echo "result=$RESULT" >> "$GITHUB_OUTPUT"
+        TOTAL=$(echo "$RESULT" | jq .total)
+
+        BLOCKING=$(echo "$RESULT" | jq --arg t "$FAIL_ON_SEVERITY" '
+          ["critical","high","medium","low"] as $order
+          | if $t == "none" then 0
+            else ($order | index($t)) as $i | [$order[:$i + 1][] as $s | .[$s]] | add end')
+
+        {
+          echo "### scan-docker — \`$IMAGE\`"
+          echo ""
+          echo "Findings: **$TOTAL** — critical $(echo "$RESULT" | jq .critical), high $(echo "$RESULT" | jq .high), medium $(echo "$RESULT" | jq .medium), low $(echo "$RESULT" | jq .low)$([ "$IGNORE_UNFIXED" = "true" ] && echo " (unfixed vulnerabilities ignored)")"
+          if [ "$TOTAL" -gt 0 ]; then
+            echo ""
+            echo "| Package | Installed | Fixed in | Vulnerability | Severity |"
+            echo "|---|---|---|---|---|"
+            jq -r '
+              {"CRITICAL":0,"HIGH":1,"MEDIUM":2,"LOW":3,"UNKNOWN":4} as $rank
+              | [.Results[]?.Vulnerabilities[]?]
+              | sort_by($rank[.Severity])
+              | .[:100][]
+              | "| \(.PkgName) | \(.InstalledVersion) | \(.FixedVersion // "-") | \(.VulnerabilityID) | \(.Severity) |"' "$RUNNER_TEMP/trivy.json"
+            [ "$TOTAL" -le 100 ] || echo "| ... | | | $((TOTAL - 100)) more not shown | |"
+          fi
+          echo ""
+          if [ "$FAIL_ON_SEVERITY" = "none" ]; then
+            echo "_Report only (fail-on-severity: none)._"
+          else
+            echo "_Fails on **$FAIL_ON_SEVERITY** and above: $BLOCKING finding(s) at or above that level._"
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        if [ "$BLOCKING" -gt 0 ]; then
+          echo "::error::$BLOCKING vulnerability finding(s) at '$FAIL_ON_SEVERITY' or above in $IMAGE"
+          exit 1
+        fi
+        echo "$TOTAL finding(s), none at '$FAIL_ON_SEVERITY' or above."

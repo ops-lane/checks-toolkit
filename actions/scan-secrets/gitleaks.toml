@@ -1,0 +1,10 @@
+# Gitleaks configuration shipped with the platform.
+#
+# It deliberately only extends Gitleaks' built-in rules. scan-secrets always
+# passes this file explicitly, so a .gitleaks.toml committed in the scanned
+# repository is NOT used: a pull request must not be able to allow-list its
+# own secret by adding a config file in the same pull request.
+title = "ops-lane checks-toolkit"
+
+[extend]
+useDefault = true

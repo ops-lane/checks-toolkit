@@ -1,0 +1,9 @@
+// These files are the body of a GitHub Release, not standalone documents: the
+// release page supplies the title, so they start with a sentence or a section
+// heading instead of a top-level heading. A config next to the files wins
+// over the platform default.
+{
+  "config": {
+    "MD041": false
+  }
+}

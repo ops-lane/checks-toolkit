@@ -1,0 +1,8 @@
+# actionlint keeps its own list of GitHub-hosted runner labels, and the newest
+# release (1.7.12, March 2026) predates Ubuntu 26.04, so it calls the label
+# unknown. The workflows pin runs-on to ubuntu-26.04 on purpose (see the
+# comment in ci.yml), so tell actionlint the label is fine. Remove this entry
+# once a release that knows the label is pinned in actions/lint-workflows.
+self-hosted-runner:
+  labels:
+    - ubuntu-26.04

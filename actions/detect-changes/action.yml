@@ -1,0 +1,264 @@
+name: "Detect Changes"
+description: "Finds every component (a directory containing a recognized manifest, at any depth) in the repo, marks which changed in this PR/push, and derives repo-wide project.*/changed.* from that same list — schema documented in docs/workflows.md"
+
+inputs:
+  base-ref:
+    description: "Commit SHA to compare from. Defaults to a value derived from the triggering event (PR base SHA, or push 'before' SHA) when omitted."
+    required: false
+  head-ref:
+    description: "Commit SHA to compare to. Defaults to a value derived from the triggering event (PR head SHA, or push 'after' SHA) when omitted."
+    required: false
+
+outputs:
+  result:
+    description: "JSON string matching the detect-changes output schema (project / changed / components) documented in docs/workflows.md"
+    value: ${{ steps.build-result.outputs.result }}
+  base-ref:
+    description: "The commit SHA the changes were compared from (the resolved base-ref input, or the PR base / previous push commit). Lets other checks, like scan-secrets, scan exactly the same range."
+    value: ${{ steps.resolve-refs.outputs.base-ref }}
+  head-ref:
+    description: "The commit SHA the changes were compared to (the resolved head-ref input, or the PR head / pushed commit)."
+    value: ${{ steps.resolve-refs.outputs.head-ref }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Resolve base and head refs
+      id: resolve-refs
+      shell: bash
+      # Everything the script needs comes in through env:, never by writing
+      # ${{ }} into the script text. A value interpolated into the script is
+      # parsed as shell code, so a crafted value could run commands; an
+      # environment variable is only ever data.
+      env:
+        INPUT_BASE_REF: ${{ inputs.base-ref }}
+        INPUT_HEAD_REF: ${{ inputs.head-ref }}
+        EVENT_NAME: ${{ github.event_name }}
+        PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        PUSH_BEFORE: ${{ github.event.before }}
+        PUSH_AFTER: ${{ github.event.after }}
+        CURRENT_SHA: ${{ github.sha }}
+      run: |
+        if [ -n "$INPUT_BASE_REF" ] && [ -n "$INPUT_HEAD_REF" ]; then
+          BASE_REF="$INPUT_BASE_REF"
+          HEAD_REF="$INPUT_HEAD_REF"
+        elif [ "$EVENT_NAME" = "pull_request" ]; then
+          BASE_REF="$PR_BASE_SHA"
+          HEAD_REF="$PR_HEAD_SHA"
+        elif [ "$EVENT_NAME" = "push" ]; then
+          BASE_REF="$PUSH_BEFORE"
+          HEAD_REF="$PUSH_AFTER"
+          if [ "$BASE_REF" = "0000000000000000000000000000000000000000" ]; then
+            echo "::warning::First push on a new branch has no previous commit; comparing against git's empty-tree object so every file counts as changed."
+            BASE_REF="4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+          fi
+        else
+          echo "::warning::Unsupported event '$EVENT_NAME' for automatic ref resolution. Pass base-ref/head-ref explicitly. Falling back to no diff."
+          BASE_REF="$CURRENT_SHA"
+          HEAD_REF="$CURRENT_SHA"
+        fi
+
+        # Both refs are used in an API URL and written to $GITHUB_OUTPUT, so
+        # they must be plain commit SHAs. Anything else (a branch name, or a
+        # value with a newline or other special characters) stops here.
+        for ref in "$BASE_REF" "$HEAD_REF"; do
+          if ! [[ "$ref" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::base-ref/head-ref must be 40-character commit SHAs (got a value of ${#ref} characters)."
+            exit 1
+          fi
+        done
+
+        echo "base-ref=$BASE_REF" >> "$GITHUB_OUTPUT"
+        echo "head-ref=$HEAD_REF" >> "$GITHUB_OUTPUT"
+
+    - name: Detect components
+      id: detect-components
+      shell: bash
+      run: |
+        # One recursive walk, done once, shared by every capability — not
+        # repeated per action later. Noise directories (installed
+        # dependencies, VCS internals, build output) are excluded here, in
+        # the one place that needs to know about them. .checks-toolkit is
+        # the platform's own checkout that ci.yml places next to the
+        # caller's code; it is not part of the repo being inspected.
+        find_component_dirs() {
+          find . -type f \
+            -not -path './.git/*' \
+            -not -path './.checks-toolkit/*' \
+            -not -path '*/node_modules/*' \
+            -not -path '*/.venv/*' \
+            -not -path '*/venv/*' \
+            -not -path '*/__pycache__/*' \
+            -not -path '*/.terraform/*' \
+            -not -path '*/dist/*' \
+            -not -path '*/build/*' \
+            \( "$@" \) \
+            -exec dirname {} \; \
+            | sed 's#^\./##; s#^$#.#' \
+            | sort -u
+        }
+
+        build_type_json() {
+          local type="$1"
+          shift
+          find_component_dirs "$@" | jq -R --arg type "$type" '{path: ., type: $type}' | jq -s .
+        }
+
+        PYTHON_COMPONENTS=$(build_type_json "python" -iname "pyproject.toml" -o -iname "requirements.txt" -o -iname "setup.py" -o -iname "Pipfile" -o -iname "*.py")
+        NODE_COMPONENTS=$(build_type_json "node" -iname "package.json" -o -iname "package-lock.json" -o -iname "pnpm-lock.yaml" -o -iname "yarn.lock")
+        DOCKER_COMPONENTS=$(build_type_json "docker" -iname "Dockerfile" -o -iname "compose.yml" -o -iname "docker-compose.yml")
+        TERRAFORM_COMPONENTS=$(build_type_json "terraform" -iname "*.tf")
+        MARKDOWN_COMPONENTS=$(build_type_json "markdown" -iname "*.md")
+
+        # One component per (directory, type) pair, deduplicated even when
+        # multiple manifests of the same type sit in the same directory
+        # (e.g. both pyproject.toml and requirements.txt at the root).
+        COMPONENTS=$(jq -sc 'add' \
+          <(echo "$PYTHON_COMPONENTS") \
+          <(echo "$NODE_COMPONENTS") \
+          <(echo "$DOCKER_COMPONENTS") \
+          <(echo "$TERRAFORM_COMPONENTS") \
+          <(echo "$MARKDOWN_COMPONENTS"))
+
+        # project.* is derived from components, not computed separately —
+        # one source of truth, so the two can never drift out of sync.
+        PROJECT_JSON=$(echo "$COMPONENTS" | jq -c '{
+          python: any(.[]; .type == "python"),
+          node: any(.[]; .type == "node"),
+          docker: any(.[]; .type == "docker"),
+          terraform: any(.[]; .type == "terraform"),
+          markdown: any(.[]; .type == "markdown")
+        }')
+
+        echo "components=$COMPONENTS" >> "$GITHUB_OUTPUT"
+        echo "project=$PROJECT_JSON" >> "$GITHUB_OUTPUT"
+
+    - name: Detect changed files
+      id: detect-changed
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      env:
+        COMPONENTS: ${{ steps.detect-components.outputs.components }}
+        BASE_REF: ${{ steps.resolve-refs.outputs.base-ref }}
+        HEAD_REF: ${{ steps.resolve-refs.outputs.head-ref }}
+      with:
+        script: |
+          // Read from the environment, not interpolated into this source:
+          // the same rule as for shell scripts.
+          const base = process.env.BASE_REF;
+          const head = process.env.HEAD_REF;
+          const components = JSON.parse(process.env.COMPONENTS);
+
+          // Git's empty tree: what "resolve refs" uses as the base for a first
+          // push on a new branch (nothing to compare against, so every file
+          // counts as changed). It is not a commit, so the compare API answers
+          // 404 for it; list every file of the head commit's tree instead.
+          const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
+          let files;
+          let truncated = false;
+          if (base === EMPTY_TREE) {
+            const { data: tree } = await github.rest.git.getTree({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tree_sha: head,
+              recursive: 'true',
+            });
+            files = tree.tree.filter((entry) => entry.type === 'blob').map((entry) => entry.path);
+            truncated = tree.truncated === true;
+          } else {
+            const { data: comparison } = await github.rest.repos.compareCommitsWithBasehead({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              basehead: `${base}...${head}`,
+            });
+            files = (comparison.files || []).map((f) => f.filename);
+            truncated = files.length >= 300;
+          }
+
+          // Same signal table as docs/workflows.md, case-insensitive filename/extension matching.
+          const signals = {
+            python: [/\.py$/i, /(^|\/)pyproject\.toml$/i, /(^|\/)requirements\.txt$/i, /(^|\/)setup\.py$/i, /(^|\/)pipfile$/i],
+            node: [/(^|\/)package\.json$/i, /(^|\/)package-lock\.json$/i, /(^|\/)pnpm-lock\.yaml$/i, /(^|\/)yarn\.lock$/i],
+            docker: [/(^|\/)dockerfile$/i, /(^|\/)compose\.yml$/i, /(^|\/)docker-compose\.yml$/i],
+            terraform: [/\.tf$/i],
+            markdown: [/\.md$/i],
+          };
+
+          // A file is "under" a component if it lives in that component's
+          // directory (or a subdirectory of it). The root component (".")
+          // matches every file. Known simplification: a nested component
+          // does not exclude its slice from a parent/root component's
+          // scope, so a change deep in one component can also mark a
+          // root-level component of the same type as changed. Fixing that
+          // needs sorting components by path depth and carving out
+          // subpaths already owned by a more specific component — not
+          // done here, revisit if double-counting proves to be a real
+          // problem in practice.
+          function isUnder(filePath, componentPath) {
+            if (componentPath === '.') return true;
+            return filePath === componentPath || filePath.startsWith(componentPath + '/');
+          }
+
+          const updatedComponents = components.map((component) => {
+            const patterns = signals[component.type] || [];
+            const changed = files.some(
+              (file) => isUnder(file, component.path) && patterns.some((pattern) => pattern.test(file))
+            );
+            return { ...component, changed };
+          });
+
+          // changed.* is derived from components the same way project.* is
+          // — one source of truth, computed once.
+          const changed = {};
+          for (const type of Object.keys(signals)) {
+            changed[type] = updatedComponents.some((c) => c.type === type && c.changed);
+          }
+
+          if (truncated) {
+            core.warning('The file list is truncated by the GitHub API (compare: ~300 files, tree: very large repositories); changed status may be incomplete.');
+          }
+
+          core.setOutput('components', JSON.stringify(updatedComponents));
+          core.setOutput('changed', JSON.stringify(changed));
+
+    - name: Build result output
+      id: build-result
+      shell: bash
+      # components[].path comes from file names in the pull request, so it is
+      # untrusted text: it must only ever reach the shell through env:.
+      env:
+        PROJECT: ${{ steps.detect-components.outputs.project }}
+        CHANGED: ${{ steps.detect-changed.outputs.changed }}
+        COMPONENTS: ${{ steps.detect-changed.outputs.components }}
+      run: |
+        RESULT=$(jq -nc \
+          --argjson project "$PROJECT" \
+          --argjson changed "$CHANGED" \
+          --argjson components "$COMPONENTS" \
+          '{project: $project, changed: $changed, components: $components}')
+
+        echo "result=$RESULT" >> "$GITHUB_OUTPUT"
+
+    - name: Write summary
+      shell: bash
+      env:
+        # Contains component paths from the pull request: untrusted, env only.
+        RESULT: ${{ steps.build-result.outputs.result }}
+      run: |
+        {
+          echo "### 🔍 Detect Changes"
+          echo ""
+          echo "| Capability | In repo | Changed |"
+          echo "|---|---|---|"
+          echo "$RESULT" | jq -r '
+            .project as $project | .changed as $changed |
+            ($project | keys[]) as $capability |
+            "| \($capability) | \(if $project[$capability] then "✅" else "❌" end) | \(if $changed[$capability] then "✅" else "❌" end) |"
+          '
+          echo ""
+          echo "### Components"
+          echo ""
+          echo "| Path | Type | Changed |"
+          echo "|---|---|---|"
+          echo "$RESULT" | jq -r '.components[] | "| \(.path | gsub("\\|"; "\\|")) | \(.type) | \(if .changed then "✅" else "❌" end) |"'
+        } >> "$GITHUB_STEP_SUMMARY"

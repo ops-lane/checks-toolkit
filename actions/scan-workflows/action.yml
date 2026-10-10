@@ -1,0 +1,94 @@
+name: "Scan Workflows"
+description: "Scans GitHub Actions workflows, composite actions and Dependabot config for security problems with zizmor (script injection, excessive permissions, unpinned actions, credential persistence, dangerous triggers). Runs offline. Reports findings in the job summary and only fails the step when fail-on-findings is enabled."
+
+inputs:
+  paths:
+    description: "Space-separated files or directories to scan, relative to the repo root. zizmor collects workflows, composite action.yml files and dependabot.yml from them. Defaults to .github; add e.g. 'actions' to also scan composite actions. Paths must not contain spaces."
+    required: false
+    default: ".github"
+  zizmor-version:
+    description: "Exact zizmor version to install. Pinned (not 'latest') so a new release or new audit rules cannot change the result of an unchanged PR."
+    required: false
+    default: "1.30.1"
+  fail-on-findings:
+    description: "Fail this step when zizmor reports any finding. Default is false (report only) — the first runs usually surface findings that are already known and still to be fixed."
+    required: false
+    default: "false"
+
+outputs:
+  finding-count:
+    description: "Number of findings zizmor reported (0 if none; suppressed findings are not counted)"
+    value: ${{ steps.zizmor.outputs.finding-count }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install zizmor
+      shell: bash
+      env:
+        VERSION: ${{ inputs.zizmor-version }}
+      run: |
+        pip install --no-cache-dir --break-system-packages --ignore-installed "zizmor==${VERSION}"
+
+    - name: zizmor
+      id: zizmor
+      shell: bash
+      env:
+        SCAN_PATHS: ${{ inputs.paths }}
+        FAIL_ON_FINDINGS: ${{ inputs.fail-on-findings }}
+      run: |
+        # Inputs are split on purpose (paths are plain names, no spaces);
+        # they arrive via env, never expanded into the script text.
+        read -ra TARGETS <<< "$SCAN_PATHS"
+
+        # --offline: no network and no token; the audits that need the
+        # GitHub API are skipped, so nothing here can leak a credential.
+        # --no-exit-codes: findings do not change the exit code, so a crash
+        # (non-zero) can be told apart from findings; the verdict is decided
+        # below from the JSON report.
+        set +e
+        zizmor --offline --no-progress --no-exit-codes --format json "${TARGETS[@]}" > "$RUNNER_TEMP/zizmor.json" 2> "$RUNNER_TEMP/zizmor.err"
+        exit_code=$?
+        set -e
+
+        if [ "$exit_code" -ne 0 ]; then
+          echo "::error::zizmor failed to run (exit code $exit_code)"
+          cat "$RUNNER_TEMP/zizmor.err"
+          exit "$exit_code"
+        fi
+
+        # Findings suppressed in the code (# zizmor: ignore[...]) are marked
+        # `ignored` and left out. Order: High first.
+        FINDINGS=$(jq -c '
+          [ .[] | select(.ignored | not)
+            | (first(.locations[] | select(.symbolic.kind == "Primary")) // .locations[0]) as $loc
+            | { severity: .determinations.severity, rule: .ident,
+                file: ($loc.symbolic.key.Local.verbatim_path // "?"),
+                line: (($loc.concrete.location.start_point.row // 0) + 1),
+                note: .desc } ]
+          | sort_by(if .severity == "High" then 0
+                    elif .severity == "Medium" then 1
+                    elif .severity == "Low" then 2 else 3 end)
+        ' "$RUNNER_TEMP/zizmor.json")
+
+        COUNT=$(echo "$FINDINGS" | jq 'length')
+        echo "finding-count=$COUNT" >> "$GITHUB_OUTPUT"
+
+        {
+          echo "### scan-workflows / zizmor"
+          echo ""
+          echo "Scanned: \`$SCAN_PATHS\` — findings: **$COUNT**"
+          if [ "$COUNT" -gt 0 ]; then
+            echo ""
+            echo "| Severity | Rule | File | Line | Description |"
+            echo "|---|---|---|---|---|"
+            echo "$FINDINGS" | jq -r '.[] | "| \(.severity) | \(.rule) | `\(.file)` | \(.line) | \(.note | gsub("\n"; " ") | gsub("\\|"; "\\|")) |"'
+            echo ""
+            echo "Rule documentation: https://docs.zizmor.sh/audits/"
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        if [ "$COUNT" -gt 0 ] && [ "$FAIL_ON_FINDINGS" = "true" ]; then
+          echo "::error::fail-on-findings is enabled and zizmor found $COUNT finding(s)"
+          exit 1
+        fi

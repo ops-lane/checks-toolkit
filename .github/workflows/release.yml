@@ -1,0 +1,203 @@
+name: Release
+
+# Publishes a version of the platform: validates it, builds the release notes
+# with git-cliff, then creates the tag and the GitHub Release in one go.
+#
+# Started by hand, with the version typed in (see docs/contributing.md,
+# "Releasing"). The tag is exact and is never moved afterwards; consumers pin
+# to it. There is no CHANGELOG file to keep in sync: the Releases page is the
+# changelog.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, without the leading v: 0.2.0, or 1.0.0-rc.1 for a pre-release"
+        required: true
+        type: string
+      dry-run:
+        description: "Only validate and show the release notes in the job summary; create no tag and no release. Switch off to publish for real."
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write
+      checks: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # git-cliff reads the commits since the last tag, and the tags
+          # themselves are needed to find that tag.
+          fetch-depth: 0
+
+      - name: Validate the release
+        id: validate
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+          DRY_RUN: ${{ inputs.dry-run }}
+          REF: ${{ github.ref }}
+          SHA: ${{ github.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          REPO: ${{ github.repository }}
+          THIS_JOB: ${{ github.job }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The version is typed by a person, so it is validated before it
+          # is used for anything, and only ever read from the environment.
+          VERSION="${VERSION#v}"
+          semver='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z][0-9A-Za-z.-]*)?$'
+          if ! [[ "$VERSION" =~ $semver ]]; then
+            echo "::error::'$VERSION' is not a version like 1.2.3 or 1.2.3-rc.1."
+            exit 1
+          fi
+          major="${BASH_REMATCH[1]}"
+          suffix="${BASH_REMATCH[4]}"
+          TAG="v$VERSION"
+
+          # Releases come from the default branch only. A dry run may start
+          # from any branch, so the pipeline can be tried on a feature branch.
+          if [ "$DRY_RUN" != "true" ] && [ "$REF" != "refs/heads/$DEFAULT_BRANCH" ]; then
+            echo "::error::A real release must run from $DEFAULT_BRANCH (this run is on $REF). Use a dry run to try it elsewhere."
+            exit 1
+          fi
+
+          if git rev-parse -q --verify "refs/tags/$TAG" > /dev/null; then
+            echo "::error::The tag $TAG already exists. A released version is never changed; pick a new one."
+            exit 1
+          fi
+
+          # A new stable version has to be higher than the highest stable one.
+          latest=$(git tag --list 'v[0-9]*' | sed 's/^v//' | grep -v -- '-' | sort -V | tail -n 1 || true)
+          if [ -z "$suffix" ] && [ -n "$latest" ]; then
+            highest=$(printf '%s\n%s\n' "$latest" "$VERSION" | sort -V | tail -n 1)
+            if [ "$highest" != "$VERSION" ]; then
+              echo "::error::$VERSION is not higher than the latest release, v$latest."
+              exit 1
+            fi
+          fi
+
+          # Never release a commit whose checks failed or are still running.
+          # This job's own check run is left out, it is running by definition.
+          problems=$(gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100" --paginate \
+            --jq '.check_runs[] | select(.name != env.THIS_JOB) | select(.status != "completed" or (.conclusion | IN("success","skipped","neutral") | not)) | "\(.name): \(.status)/\(.conclusion // "-")"')
+          if [ -n "$problems" ]; then
+            echo "::error::The checks of commit ${SHA:0:7} are not all green:"
+            echo "$problems"
+            exit 1
+          fi
+          count=$(gh api "repos/$REPO/commits/$SHA/check-runs" --jq '.total_count')
+          if [ "$count" -le 1 ]; then
+            echo "::warning::Commit ${SHA:0:7} has no check runs other than this one; nothing was checked before releasing it."
+          fi
+
+          # Before 1.0.0 the interface may still change, and a suffix means a
+          # release candidate: both are marked as pre-releases.
+          if [ "$major" = "0" ] || [ -n "$suffix" ]; then prerelease=true; else prerelease=false; fi
+
+          {
+            echo "tag=$TAG"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+          echo "Releasing $TAG from ${SHA:0:7} (pre-release: $prerelease, latest stable so far: ${latest:-none})"
+
+      - name: Build the release notes
+        id: notes
+        shell: bash
+        env:
+          TAG: ${{ steps.validate.outputs.tag }}
+          PRERELEASE: ${{ steps.validate.outputs.prerelease }}
+          DRY_RUN: ${{ inputs.dry-run }}
+          # Official git-cliff image, pinned by version AND digest: a tag can
+          # be re-pointed, a digest cannot. Bump both together. The entrypoint
+          # is bypassed because it wants to start as root and switch user; the
+          # container runs as the runner's own user instead.
+          CLIFF_IMAGE: ghcr.io/orhun/git-cliff/git-cliff:2.14.2@sha256:1e696a381a1b0366bb6ccbb6bd4e50e73473fda88eab3a757b95e0d0d66c9531
+        run: |
+          cliff() {
+            docker run --rm \
+              --entrypoint git-cliff \
+              --cap-drop ALL \
+              --security-opt no-new-privileges \
+              --user "$(id -u):$(id -g)" \
+              --env HOME=/tmp \
+              --env GIT_CONFIG_COUNT=1 --env GIT_CONFIG_KEY_0=safe.directory --env GIT_CONFIG_VALUE_0=/repo \
+              --volume "$PWD":/repo:ro \
+              --workdir /repo \
+              "$CLIFF_IMAGE" --config cliff.toml "$@"
+          }
+
+          # A hand-written note for a version wins over the generated one.
+          # The first release needs it: the history is squashed before the
+          # project goes public, so there are no commits to build notes from.
+          curated=".github/release-notes/$TAG.md"
+          if [ -f "$curated" ]; then
+            cp "$curated" "$RUNNER_TEMP/notes.md"
+            source_of_notes="the hand-written file \`$curated\`"
+          else
+            # sed drops the blank lines the template leaves at the top.
+            cliff --unreleased --tag "$TAG" | sed '/./,$!d' > "$RUNNER_TEMP/notes.md"
+            source_of_notes="git-cliff, from the commits since the last tag"
+          fi
+
+          if ! grep -q '[^[:space:]]' "$RUNNER_TEMP/notes.md"; then
+            echo "::error::There is nothing to put in the release notes: no Conventional Commits since the last tag, and no $curated."
+            exit 1
+          fi
+
+          # Information only: what git-cliff would pick from the commit types.
+          suggestion=$(cliff --unreleased --bumped-version 2>/dev/null || true)
+
+          {
+            echo "### Release $TAG"
+            echo ""
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "**Dry run:** nothing was created. Run again with *dry-run* switched off to publish."
+            else
+              echo "Publishing now."
+            fi
+            echo ""
+            echo "- Pre-release: **$PRERELEASE**"
+            echo "- Notes from: $source_of_notes"
+            echo "- git-cliff would suggest the version: \`${suggestion:-none (no unreleased commits)}\` (a suggestion only, you chose $TAG)"
+            echo ""
+            echo "#### Release notes"
+            echo ""
+            cat "$RUNNER_TEMP/notes.md"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish the release
+        if: ${{ !inputs.dry-run }}
+        shell: bash
+        env:
+          TAG: ${{ steps.validate.outputs.tag }}
+          PRERELEASE: ${{ steps.validate.outputs.prerelease }}
+          SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # One call creates the tag on exactly the commit that was validated
+          # and the release that goes with it. Pre-releases are not marked
+          # "latest".
+          flags=()
+          if [ "$PRERELEASE" = "true" ]; then flags+=(--prerelease); else flags+=(--latest); fi
+
+          gh release create "$TAG" \
+            --repo "$REPO" \
+            --target "$SHA" \
+            --title "$TAG" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            "${flags[@]}"
+
+          url=$(gh release view "$TAG" --repo "$REPO" --json url --jq .url)
+          echo "Published $url"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Published:** $url" >> "$GITHUB_STEP_SUMMARY"

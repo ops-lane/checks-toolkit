@@ -1,0 +1,71 @@
+name: "Lint Commits"
+description: "Checks that every commit in a range has a Conventional Commits subject (feat: ..., fix(scope): ..., and so on), because the release notes are generated from those subjects. Merge commits are not checked. Fails the step and lists the offending commits in the job summary. The repository must be checked out with full history (fetch-depth: 0)."
+
+inputs:
+  base-ref:
+    description: "Commit SHA the range starts after (exclusive) - for a pull request, the base branch tip."
+    required: true
+  head-ref:
+    description: "Commit SHA the range ends at (inclusive) - for a pull request, the head commit."
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: Check commit subjects
+      shell: bash
+      env:
+        BASE_REF: ${{ inputs.base-ref }}
+        HEAD_REF: ${{ inputs.head-ref }}
+      run: |
+        # Commit messages are written by whoever opened the pull request, so
+        # they are untrusted text: they are only read into variables here,
+        # never expanded into a command, and printed indented so a message
+        # cannot break out of the job summary's formatting.
+        for ref in "$BASE_REF" "$HEAD_REF"; do
+          if ! [[ "$ref" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::base-ref/head-ref must be 40-character commit SHAs."
+            exit 1
+          fi
+          if ! git cat-file -e "$ref^{commit}" 2>/dev/null; then
+            echo "::error::Commit ${ref:0:7} is not in this checkout. Check out with fetch-depth: 0."
+            exit 1
+          fi
+        done
+
+        # type(optional-scope)!: description - the Conventional Commits shape.
+        # A GitHub-made revert ('Revert "..."') is also accepted; git-cliff
+        # leaves those out of the notes.
+        pattern='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9._/-]+\))?!?: .+'
+
+        total=0
+        bad=()
+        while IFS=$'\t' read -r sha subject; do
+          [ -n "$sha" ] || continue
+          total=$((total + 1))
+          if [[ "$subject" =~ $pattern ]] || [[ "$subject" == Revert\ \"* ]]; then
+            continue
+          fi
+          bad+=("${sha:0:7}    $subject")
+        done < <(git log --no-merges --format='%H%x09%s' "$BASE_REF..$HEAD_REF")
+
+        {
+          echo "### lint-commits"
+          echo ""
+          echo "Checked **$total** commit(s) in \`${BASE_REF:0:7}..${HEAD_REF:0:7}\` (merge commits are skipped): **${#bad[@]}** without a Conventional Commits subject."
+          if [ "${#bad[@]}" -gt 0 ]; then
+            echo ""
+            echo "The release notes are built from these subjects, so a commit that does not follow the format would be missing from them."
+            echo "Expected: \`type(scope): description\` with type one of feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert."
+            echo ""
+            for line in "${bad[@]}"; do
+              echo "    $line"
+            done
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        if [ "${#bad[@]}" -gt 0 ]; then
+          echo "::error::${#bad[@]} commit(s) do not follow Conventional Commits. See the job summary for the list."
+          exit 1
+        fi
+        echo "All $total commit(s) follow Conventional Commits."
