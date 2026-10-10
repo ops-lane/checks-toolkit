@@ -1,3 +1,0 @@
-[codespell]
-# Archived Dutch plan: codespell checks English only. Paths are matched as
-# passed on the command line (lint-markdown passes ./*.md).

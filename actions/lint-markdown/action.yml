@@ -111,8 +111,22 @@ runs:
         shopt -s nullglob
         files=(./*.md)
 
+        # Mount the whole checkout, not just this directory: a relative link
+        # such as ../actions/x/README.md leaves the directory being checked
+        # and would otherwise be reported as missing. The files checked stay
+        # the ones directly in the working directory; --root-dir is the
+        # checkout root, so a link starting with / resolves like on GitHub.
+        workspace=$(realpath "$GITHUB_WORKSPACE")
+        rel=$(realpath --relative-to="$workspace" "$PWD")
+        case "$rel" in
+          ..|../*)
+            echo "::error::working-directory must be inside the checkout"
+            exit 1
+            ;;
+        esac
+
         # The links come from the (possibly untrusted) PR, so lychee runs in
-        # a throwaway container: read-only mount of the files, no
+        # a throwaway container: read-only mount of the checkout, no
         # capabilities, and no secrets or tokens passed in. Private,
         # loopback and link-local addresses are excluded so a link cannot
         # make the runner probe its own network or the cloud metadata
@@ -123,8 +137,8 @@ runs:
         docker run --rm \
           --cap-drop ALL \
           --security-opt no-new-privileges \
-          --volume "$PWD":/input:ro \
-          --workdir /input \
+          --volume "$workspace":/input:ro \
+          --workdir "/input/$rel" \
           "$LYCHEE_IMAGE" \
           --no-progress \
           --format json \

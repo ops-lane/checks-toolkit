@@ -41,7 +41,6 @@ flowchart TD
 - **Security** — always-on / conditional / scheduled layers, see
   [security.md](./security.md).
 
-  
 ## Repository and org structure
 
 - Org: `ops-lane` — platform only (`checks-toolkit` +
