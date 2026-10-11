@@ -3,7 +3,7 @@
 [![Self-test](https://github.com/ops-lane/checks-toolkit/actions/workflows/self-test.yml/badge.svg?branch=development)](https://github.com/ops-lane/checks-toolkit/actions/workflows/self-test.yml)
 
 Reusable GitHub Actions workflows that give a repository CI and security
-checks with almost no configuration. A repository adds a few lines that call
+checks, with almost no configuration. A repository adds a few lines that call
 the workflows; the platform works out which technologies are present, what
 changed in a pull request, and runs only the checks that are relevant.
 

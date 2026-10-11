@@ -10,8 +10,10 @@ taken seriously.
 Please **do not open a public issue** for a security problem.
 
 Use GitHub's private reporting instead: go to the **Security** tab of this
-repository and choose **Report a vulnerability**. Only the maintainer can see
-the report.
+repository and choose **Report a vulnerability**, or open
+[the report form](https://github.com/ops-lane/checks-toolkit/security/advisories/new)
+directly. Only the maintainer can see the report. How it works is described in
+[GitHub's documentation on privately reporting a vulnerability](https://docs.github.com/en/code-security/security-advisories/guidance-on-reporting-and-writing-information-about-vulnerabilities/privately-reporting-a-security-vulnerability).
 
 Include what you found, how to reproduce it (a minimal workflow or pull
 request is ideal), and what you think the impact is.
@@ -23,7 +25,8 @@ security team. Reports are handled on a best-effort basis: expect an
 acknowledgement and a first assessment, but there is no guaranteed response
 time and there is no bug bounty.
 
-Fixes are released as a new version. Please allow time for a fix before
+Fixes are released as a new version, listed on the
+[releases page](https://github.com/ops-lane/checks-toolkit/releases). Please allow time for a fix before
 disclosing the issue publicly; the maintainer will credit you in the fix
 unless you prefer not to be named.
 

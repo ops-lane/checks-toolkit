@@ -46,7 +46,7 @@ result table per workflow), the `skip-ci` label, and the severity policy
 |---|---|
 | Run on GitHub | Everything in `ci.yml` and `security.yml` except CodeQL. A test consumer (`checks-toolkit-test`) calls both workflows over 20+ scenarios, each with an expected result: the right check fails for the right reason, the others pass, a hostile folder name is treated as text, a secret added and removed in a later commit is found without its value being printed, the `skip-ci` label skips everything and its removal restores the checks, and the two gate comments stay separate. The platform's self-test covers the Markdown matrix, the full-history secret scan and the new-branch fallback |
 | Not yet seen | The `workflows` job of `ci.yml`; `check-repo.yml`, `dependency-review.yml`, `labeler.yml`, `scorecard.yml` and `stale.yml`; the SBOM, archive and attestations in `release.yml`; a pull request from a fork (the repository is public now, so this can be tried), a caller that triggers on `pull_request_target`, and `fail-on-findings: true` on `audit-python` |
-| Not run at all | **CodeQL.** It is off by default because it needs a public repository or GitHub Advanced Security; only its result mapping was tested. Semgrep, the other half of `scan-code`, has run locally |
+| Not run at all | **CodeQL through `scan-code`.** It is off by default because it needs a public repository or GitHub Advanced Security, and it only supports Python and JavaScript/TypeScript; only its result mapping was tested. This repository itself is scanned by GitHub's CodeQL default setup (language `actions`, no findings), which is separate from the platform. Semgrep, the other half of `scan-code`, has run locally |
 
 Each action's own README says exactly what was verified for it. Closing the
 "static only" and "not run at all" rows is the next piece of work.
@@ -64,7 +64,7 @@ with hand-written notes.
 1. Close the "not yet seen" row: a pull request from a fork, a caller that
    triggers on `pull_request_target`, and `fail-on-findings: true` on
    `audit-python`.
-2. First real CodeQL run: switch it on with `codeql: true` in the self-test.
+2. First real CodeQL run through `scan-code`. It cannot run on this repository (no Python or JavaScript, so the `code` job never starts), so it needs `scan-code` to learn the `actions` language, or a test consumer with Python or Node code. Until then this repository relies on GitHub's CodeQL default setup, which cannot be combined with uploading CodeQL results from a workflow.
 3. Phase 4: central Mergify configuration.
 4. Scheduled (nightly) full scans: CodeQL, dependencies and container images
    across the whole repository instead of per pull request.

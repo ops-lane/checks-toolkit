@@ -241,6 +241,15 @@ jobs:
           flags=()
           if [ "$PRERELEASE" = "true" ]; then flags+=(--prerelease); else flags+=(--latest); fi
 
+          # A draft left over from an earlier, failed run would be found
+          # instead of this one, so it has to be dealt with first.
+          existing=$(gh api "repos/$REPO/releases" --paginate \
+            --jq '.[] | select(.draft) | select(.name == env.TAG) | .html_url' | head -n 1)
+          if [ -n "$existing" ]; then
+            echo "::error::A draft release for $TAG already exists: $existing. Publish it or delete it, then run again."
+            exit 1
+          fi
+
           gh release create "$TAG" \
             --repo "$REPO" \
             --draft \
@@ -250,9 +259,11 @@ jobs:
             "${flags[@]}" \
             "$ASSETS"/*
 
-          # A draft has no tag yet, so it is found in the list, not by tag.
+          # A draft has no tag yet: GitHub gives it a temporary name
+          # ("untagged-...") until it is published. So it is found by its
+          # title, which is the tag, and not by tag name.
           id=$(gh api "repos/$REPO/releases" --paginate \
-            --jq ".[] | select(.draft and .tag_name == \"$TAG\") | .id" | head -n 1)
+            --jq '.[] | select(.draft) | select(.name == env.TAG) | .id' | head -n 1)
           if [ -z "$id" ]; then
             echo "::error::The draft release for $TAG was not found."
             exit 1
