@@ -1,0 +1,77 @@
+name: "Lint CODEOWNERS"
+description: "Checks the CODEOWNERS file with GitHub's own validator (the codeowners errors API): syntax errors, owners that do not exist, owners without write access, and patterns that match nothing useful. Optionally also fails when there is no CODEOWNERS file. Fails the step on any finding; findings are written to the job summary."
+
+inputs:
+  required:
+    description: "Fail when the repository has no CODEOWNERS file (in .github/, the root or docs/). Default is false: a repository does not have to have one."
+    required: false
+    default: "false"
+  ref:
+    description: "Commit, branch or tag whose CODEOWNERS file is validated. Defaults to the commit of the triggering event."
+    required: false
+    default: ${{ github.sha }}
+  token:
+    description: "Token for the GitHub API. Needs contents: read."
+    required: false
+    default: ${{ github.token }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Check CODEOWNERS
+      shell: bash
+      env:
+        REQUIRED: ${{ inputs.required }}
+        REF: ${{ inputs.ref }}
+        GH_TOKEN: ${{ inputs.token }}
+        REPO: ${{ github.repository }}
+      run: |
+        set -euo pipefail
+
+        if ! [[ "$REF" =~ ^[0-9A-Za-z._/-]+$ ]]; then
+          echo "::error::ref contains characters that are not allowed in a git ref."
+          exit 1
+        fi
+
+        # GitHub reads CODEOWNERS from these three places, in this order.
+        found=""
+        for candidate in .github/CODEOWNERS CODEOWNERS docs/CODEOWNERS; do
+          if [ -f "$candidate" ]; then found="$candidate"; break; fi
+        done
+
+        if [ -z "$found" ]; then
+          {
+            echo "### lint-codeowners"
+            echo ""
+            echo "No CODEOWNERS file found (looked in \`.github/\`, the root and \`docs/\`)."
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$REQUIRED" = "true" ]; then
+            echo "::error::There is no CODEOWNERS file and required is true."
+            exit 1
+          fi
+          echo "No CODEOWNERS file; nothing to check."
+          exit 0
+        fi
+
+        # GitHub's own validator: it knows which users and teams exist and
+        # have write access, which a local check cannot.
+        gh api "repos/$REPO/codeowners/errors?ref=$REF" > "$RUNNER_TEMP/codeowners.json"
+        COUNT=$(jq '.errors | length' "$RUNNER_TEMP/codeowners.json")
+
+        {
+          echo "### lint-codeowners"
+          echo ""
+          echo "File: \`$found\` — findings: **$COUNT**"
+          if [ "$COUNT" -gt 0 ]; then
+            echo ""
+            echo "| Line | Kind | Problem |"
+            echo "|---|---|---|"
+            jq -r '.errors[] | "| \(.line) | \(.kind) | \(.message | gsub("\n"; " ") | gsub("\\|"; "\\|")) |"' "$RUNNER_TEMP/codeowners.json"
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        if [ "$COUNT" -gt 0 ]; then
+          echo "::error::$COUNT problem(s) in $found"
+          exit 1
+        fi
+        echo "$found is valid."

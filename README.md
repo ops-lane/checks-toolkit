@@ -1,5 +1,7 @@
 # Checks Toolkit
 
+[![Self-test](https://github.com/ops-lane/checks-toolkit/actions/workflows/self-test.yml/badge.svg?branch=development)](https://github.com/ops-lane/checks-toolkit/actions/workflows/self-test.yml)
+
 Reusable GitHub Actions workflows that give a repository CI and security
 checks with almost no configuration. A repository adds a few lines that call
 the workflows; the platform works out which technologies are present, what
@@ -90,6 +92,7 @@ permissions are for: [docs/workflows.md](docs/workflows.md).
 | Docker | `docker build` | Trivy image scan |
 | Terraform | `terraform fmt -check` | Trivy misconfiguration scan |
 | Markdown | markdownlint, codespell, lychee | — |
+| Workflows | actionlint | zizmor (report only) |
 | Whole repository | — | Gitleaks (always), Semgrep, and CodeQL once switched on (see below) |
 
 Every check is also a standalone composite action in [`actions/`](actions/),

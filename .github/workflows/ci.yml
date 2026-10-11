@@ -6,7 +6,7 @@ on:
         required: true
         type: string
       fail-on-findings:
-        description: "Fail lint-markdown when it finds broken links. Default is false (report only): link checks depend on third-party sites, so a failure often has nothing to do with the change. Security findings (dependencies, secrets, code) are not part of this workflow - see security.yml."
+        description: "Fail lint-markdown when it finds broken links, and scan-workflows (zizmor) when it reports findings. Default is false (report only): link checks depend on third-party sites, so a failure often has nothing to do with the change. Security findings (dependencies, secrets, code) are not part of this workflow - see security.yml."
         required: false
         type: boolean
         default: false
@@ -37,6 +37,7 @@ jobs:
       docker-components: ${{ steps.filter.outputs.docker-components }}
       terraform-components: ${{ steps.filter.outputs.terraform-components }}
       markdown-components: ${{ steps.filter.outputs.markdown-components }}
+      workflows-components: ${{ steps.filter.outputs.workflows-components }}
     steps:
       - name: Refuse to run on pull_request_target
         # pull_request runs with a read-only token and no secrets, so it is
@@ -99,7 +100,7 @@ jobs:
           # A matrix needs one filtered, changed-only array per capability,
           # so that filtering happens here, in the consuming workflow,
           # instead of being baked into the (deliberately generic) action.
-          for type in python node docker terraform markdown; do
+          for type in python node docker terraform markdown workflows; do
             components=$(echo "$RESULT" | jq -c --arg type "$type" \
               '[.components[] | select(.type == $type and .changed == true)]')
             echo "${type}-components=$components" >> "$GITHUB_OUTPUT"
@@ -261,9 +262,44 @@ jobs:
           working-directory: ${{ matrix.component.path }}
           fail-on-broken-links: ${{ inputs.fail-on-findings }}
 
+  workflows:
+    name: workflows (${{ matrix.component.path }})
+    needs: detect
+    if: needs.detect.outputs.skip != 'true' && fromJSON(needs.detect.outputs.result).changed.workflows
+    runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix:
+        component: ${{ fromJSON(needs.detect.outputs.workflows-components) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Checkout checks-toolkit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: ops-lane/checks-toolkit
+          ref: ${{ inputs.platform-ref }}
+          path: .checks-toolkit
+          token: ${{ secrets.platform-read-token || github.token }}
+
+      # Both read the repo root: GitHub only runs workflows from there, so
+      # the one workflows component has no working-directory.
+      - name: lint-workflows
+        uses: ./.checks-toolkit/actions/lint-workflows
+
+      - name: scan-workflows
+        if: ${{ !cancelled() }}
+        uses: ./.checks-toolkit/actions/scan-workflows
+        with:
+          fail-on-findings: ${{ inputs.fail-on-findings }}
+
   ci-gate:
     name: CI gate
-    needs: [detect, python, node, docker, terraform, markdown]
+    needs: [detect, python, node, docker, terraform, markdown, workflows]
     if: always()
     runs-on: ubuntu-26.04
     # Callers must grant at least these (a called workflow can't elevate

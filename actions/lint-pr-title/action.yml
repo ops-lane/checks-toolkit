@@ -1,0 +1,46 @@
+name: "Lint PR Title"
+description: "Checks that a pull request title is a Conventional Commits subject (feat: ..., fix(scope): ..., and so on). Useful when a pull request is merged by squashing, because the title then becomes the commit subject the release notes are built from. Fails the step and explains the expected format in the job summary."
+
+inputs:
+  title:
+    description: "The pull request title to check, normally github.event.pull_request.title."
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: Check pull request title
+      shell: bash
+      env:
+        # The title is written by whoever opened the pull request, so it is
+        # untrusted text: it is only read into a variable here, never
+        # expanded into a command, and printed indented so it cannot break
+        # out of the job summary's formatting.
+        PR_TITLE: ${{ inputs.title }}
+      run: |
+        # type(optional-scope)!: description - the same shape lint-commits
+        # accepts. A GitHub-made revert ('Revert "..."') is also accepted;
+        # git-cliff leaves those out of the notes.
+        pattern='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9._/-]+\))?!?: .+'
+
+        if [[ "$PR_TITLE" =~ $pattern ]] || [[ "$PR_TITLE" == Revert\ \"* ]]; then
+          {
+            echo "### lint-pr-title"
+            echo ""
+            echo "The pull request title follows Conventional Commits."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "The pull request title follows Conventional Commits."
+          exit 0
+        fi
+
+        {
+          echo "### lint-pr-title"
+          echo ""
+          echo "The pull request title does not follow Conventional Commits:"
+          echo ""
+          echo "    $PR_TITLE"
+          echo ""
+          echo "Expected: \`type(scope): description\` with type one of feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert. Edit the title and this check runs again."
+        } >> "$GITHUB_STEP_SUMMARY"
+        echo "::error::The pull request title does not follow Conventional Commits. See the job summary."
+        exit 1

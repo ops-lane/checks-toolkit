@@ -1,0 +1,105 @@
+name: "Build SBOM"
+description: "Writes a software bill of materials (SBOM) for the repository: either from GitHub's dependency graph (SPDX, includes the GitHub Actions a repo uses and every ecosystem the graph supports) or from the files with Trivy (CycloneDX). The SBOM is only written to a file; attaching or attesting it is up to the caller."
+
+inputs:
+  source:
+    description: "Where the SBOM comes from: 'github' (the repository's dependency graph, SPDX JSON, needs the dependency graph to be on) or 'trivy' (Trivy reads the lock files and installed packages in working-directory, CycloneDX JSON)."
+    required: false
+    default: "github"
+  output:
+    description: "Path of the file to write. Defaults to sbom.spdx.json for github and sbom.cdx.json for trivy, in the runner's temporary directory. A relative path is relative to the workspace."
+    required: false
+    default: ""
+  working-directory:
+    description: "Directory Trivy reads (source: trivy only). Defaults to the repo root."
+    required: false
+    default: "."
+  token:
+    description: "Token for the GitHub API (source: github only). Needs contents: read."
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  file:
+    description: "Absolute path of the SBOM file that was written."
+    value: ${{ steps.build.outputs.file }}
+  format:
+    description: "The SBOM format: spdx-json or cyclonedx-json."
+    value: ${{ steps.build.outputs.format }}
+  packages:
+    description: "The number of packages in the SBOM."
+    value: ${{ steps.build.outputs.packages }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Build the SBOM
+      id: build
+      shell: bash
+      env:
+        SOURCE: ${{ inputs.source }}
+        OUTPUT: ${{ inputs.output }}
+        WORKING_DIR: ${{ inputs.working-directory }}
+        GH_TOKEN: ${{ inputs.token }}
+        REPO: ${{ github.repository }}
+        WORKSPACE: ${{ github.workspace }}
+        # Same pinned Trivy image as scan-docker, scan-terraform and
+        # scan-licenses - bump all of them together.
+        TRIVY_IMAGE: ghcr.io/aquasecurity/trivy:0.75.0@sha256:af6acf9a6b85dfe389a1941505c0ce9efef52a4719635e1a962f022a3d855daa
+      run: |
+        set -euo pipefail
+
+        case "$SOURCE" in
+          github) default_name="sbom.spdx.json"; format="spdx-json" ;;
+          trivy)  default_name="sbom.cdx.json";  format="cyclonedx-json" ;;
+          *) echo "::error::source must be github or trivy (got '$SOURCE')"; exit 1 ;;
+        esac
+
+        if [ -z "$OUTPUT" ]; then OUTPUT="$RUNNER_TEMP/$default_name"; fi
+        case "$OUTPUT" in /*) ;; *) OUTPUT="$WORKSPACE/$OUTPUT" ;; esac
+        mkdir -p "$(dirname "$OUTPUT")"
+
+        if [ "$SOURCE" = "github" ]; then
+          # GitHub builds the SBOM from the dependency graph: it knows the
+          # ecosystems GitHub supports, including the Actions used by
+          # workflows, and needs no scan of the files here.
+          gh api "repos/$REPO/dependency-graph/sbom" --jq '.sbom' > "$OUTPUT"
+          packages=$(jq '.packages | length' "$OUTPUT")
+        else
+          # The files may come from a pull request, so Trivy runs in a
+          # throwaway container: files read-only, only the output folder
+          # writable, no network, no capabilities, own user.
+          outdir=$(dirname "$OUTPUT")
+          cd "$WORKING_DIR"
+          docker run --rm \
+            --network none \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --user "$(id -u):$(id -g)" \
+            --env HOME=/tmp --env TRIVY_CACHE_DIR=/tmp/trivy \
+            --volume "$PWD":/src:ro \
+            --volume "$outdir":/out \
+            "$TRIVY_IMAGE" fs /src \
+              --scanners license \
+              --format cyclonedx \
+              --output "/out/$(basename "$OUTPUT")" --quiet
+          packages=$(jq '[.components[]? | select(.type == "library")] | length' "$OUTPUT")
+        fi
+
+        if ! jq -e . "$OUTPUT" > /dev/null 2>&1; then
+          echo "::error::The SBOM at $OUTPUT is not valid JSON."
+          exit 1
+        fi
+
+        {
+          echo "file=$OUTPUT"
+          echo "format=$format"
+          echo "packages=$packages"
+        } >> "$GITHUB_OUTPUT"
+
+        {
+          echo "### build-sbom"
+          echo ""
+          echo "Source: **$SOURCE** — format: **$format** — packages: **$packages**"
+        } >> "$GITHUB_STEP_SUMMARY"
+        echo "Wrote the SBOM ($packages package(s), $format) to $OUTPUT"

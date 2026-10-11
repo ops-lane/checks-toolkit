@@ -13,28 +13,30 @@ major version.
     "node": false,
     "docker": true,
     "terraform": true,
-    "markdown": true
+    "markdown": true,
+    "workflows": true
   },
   "changed": {
     "python": false,
     "node": false,
     "docker": false,
     "terraform": true,
-    "markdown": true
+    "markdown": true,
+    "workflows": true
   },
   "components": [
     { "path": "backend", "type": "python", "changed": false },
-    { "path": "frontend", "type": "node", "changed": true }
+    { "path": "frontend", "type": "node", "changed": true },
+    { "path": ".", "type": "workflows", "changed": false }
   ]
 }
 ```
 
-`components` is in the schema from day one (even though the MVP doesn't
-use it yet), so monorepo support later doesn't require a breaking schema
-change. A later, non-MVP extension is a `capabilities` array per
-component (e.g. `["lint", "typecheck"]`).
+`components` has one entry per directory that holds a technology, which is
+what makes monorepos work. A possible later extension is a `capabilities`
+array per component (e.g. `["lint", "typecheck"]`).
 
-## Detection signals (MVP)
+## Detection signals
 
 | Capability | Signals |
 |---|---|
@@ -43,6 +45,9 @@ component (e.g. `["lint", "typecheck"]`).
 | Docker | `Dockerfile`, `compose.yml`, `docker-compose.yml` |
 | Terraform | `*.tf` |
 | Markdown | `*.md` |
+| Workflows | `.github/workflows/*.yml`, any `action.yml`, `.github/dependabot.yml` |
+
+`workflows` is a single component for the whole repository (`path: "."`), not one per directory, because GitHub only runs workflows from `.github/workflows` of the repository root. It is present when that folder has a workflow file or the repository has a composite `action.yml`.
 
 No weighting in v1: any signal (weak or strong) sets the capability to
 `true`. See [decisions.md](./decisions.md), row "`detect-changes` signal
@@ -92,6 +97,8 @@ flowchart LR
     Terraform --> Validate[terraform validate]
     Terraform --> TrivyConfig["trivy config (misconfig)"]
     Markdown --> Markdownlint
+    Workflows --> Actionlint[actionlint]
+    Workflows --> Zizmor[zizmor]
 ```
 
 `pip-audit` and `npm`/`pnpm audit` are each capability's native SCA tool
@@ -114,7 +121,8 @@ Every action below lives at `actions/<name>/action.yml` in this repo,
 named per the `<type>-<target>` convention in
 [contributing.md](./contributing.md#naming). `ci.yml` calls the `lint-*`,
 `typecheck-*` and `build-*` actions, `security.yml` the `audit-*` and
-`scan-*` ones. Every action listed here is implemented and has its own
+`scan-*` ones. A few are standalone and not part of either workflow; they are
+marked as such below, and this repository runs them from its own workflows. Every action listed here is implemented and has its own
 README in its folder; see each README for what has been verified and what
 has not.
 
@@ -134,9 +142,17 @@ has not.
 | `scan-terraform` | scan | terraform | Trivy config (misconfig) | ✅ | Official Trivy container image, pinned by digest. See [its README](../actions/scan-terraform/README.md) |
 | `lint-markdown` | lint | markdown | markdownlint-cli2 + codespell + lychee | ✅ | Own CLI calls — `npx markdownlint-cli2`, `pip install codespell`, lychee via its Docker image; no Action needed. See [its README](../actions/lint-markdown/README.md) |
 | `scan-secrets` | scan | secrets | Gitleaks (always-on) | ✅ | Official Gitleaks container image, pinned by digest. See [its README](../actions/scan-secrets/README.md) |
+| `lint-pr-title` | lint | pull request title | A regular expression over the title (Conventional Commits) | ✅ | Own CLI call. Used by `check-pr-title.yml` on this repository's own pull requests, not by `ci.yml`. See [its README](../actions/lint-pr-title/README.md) |
 | `lint-commits` | lint | commits | A regular expression over `git log` (Conventional Commits) | ✅ | Own CLI call. Used by `check-commits.yml` on this repository's own pull requests, not by `ci.yml`. See [its README](../actions/lint-commits/README.md) |
 | `lint-workflows` | lint | workflows | actionlint | ✅ implemented, not yet run on GitHub | Own CLI call — pinned release tarball, SHA-256 verified before use; no third-party Action. See [its README](../actions/lint-workflows/README.md) |
 | `scan-workflows` | scan | workflows | zizmor (offline) | ✅ implemented, not yet run on GitHub | Own CLI call — `pip install zizmor==<pinned>`; no third-party Action. Scans workflows, composite actions and `dependabot.yml`. See [its README](../actions/scan-workflows/README.md) |
+| `lint-action-docs` | lint | action docs | A short Python script (PyYAML) | ✅ | Own script. Used by `check-repo.yml` on this repository, not by `ci.yml`. See [its README](../actions/lint-action-docs/README.md) |
+| `lint-codeowners` | lint | codeowners | GitHub's codeowners errors API | ✅ | Own CLI call (`gh api`). Used by `check-repo.yml`, not by `ci.yml`. See [its README](../actions/lint-codeowners/README.md) |
+| `lint-shell` | lint | shell | ShellCheck | ✅ | Official ShellCheck container image, pinned by digest. Checks `*.sh` files and the `run:` blocks of composite actions. Used by `check-repo.yml`, not by `ci.yml`. See [its README](../actions/lint-shell/README.md) |
+| `lint-yaml` | lint | yaml | yamllint | ✅ | Own CLI call — `pip install yamllint==<pinned>`. Used by `check-repo.yml`, not by `ci.yml`. See [its README](../actions/lint-yaml/README.md) |
+| `audit-dependencies` | audit | dependencies | GitHub's dependency review | ✅ | Wraps the official `actions/dependency-review-action` (GitHub), pinned by SHA. Used by `dependency-review.yml`, not by `security.yml`. See [its README](../actions/audit-dependencies/README.md) |
+| `scan-licenses` | scan | licenses | Trivy (license scanner) | ✅ | Official Trivy container image, pinned by digest. Standalone, not part of `security.yml`. See [its README](../actions/scan-licenses/README.md) |
+| `build-sbom` | build | sbom | GitHub's dependency graph, or Trivy | ✅ | Own CLI call (`gh api`) or the official Trivy container image. Used by `release.yml`. See [its README](../actions/build-sbom/README.md) |
 | `scan-code` | scan | code | CodeQL + Semgrep, one combined run across whichever languages are present — see [decisions.md](./decisions.md), row "CodeQL/Semgrep bundling" | ✅ | `github/codeql-action` (GitHub itself, pinned to a commit) + the official Semgrep container image, pinned by digest. See [its README](../actions/scan-code/README.md) |
 
 The tools themselves run as official container images pinned by version and digest (not as third-party Actions) wherever that is possible — see [decisions.md](./decisions.md), row "Security tools run as pinned container images, not third-party Actions".
@@ -153,9 +169,29 @@ does not use `detect-changes`. Only `actionlint` blocks; `zizmor` reports
 until its known findings are resolved (see
 [decisions.md](./decisions.md), row "Workflow checks").
 
-Wiring `lint-workflows`/`scan-workflows` into `ci.yml` as a `workflows`
-capability for consumer repos is a later step (needs a new
-`detect-changes` signal) — see [roadmap.md](./roadmap.md).
+`ci.yml` also offers the same two checks to consumer repositories through
+the `workflows` capability of `detect-changes`: when a pull request changes a
+workflow, an `action.yml` or `dependabot.yml`, the `workflows` job runs
+`lint-workflows` (blocking) and `scan-workflows` (report only, unless
+`fail-on-findings` is on). Not yet run on GitHub — see
+[roadmap.md](./roadmap.md).
+
+## This repository's other workflows
+
+Besides `ci.yml`, `security.yml` and `check-workflows.yml`, the repository
+runs a few workflows only on itself. None of them is part of the interface a
+consumer calls.
+
+| Workflow | What it does |
+|---|---|
+| `check-repo.yml` | `lint-action-docs`, `lint-codeowners`, `lint-shell` and `lint-yaml` on the repository's own files |
+| `check-commits.yml` | `lint-commits`: every commit follows Conventional Commits |
+| `check-pr-title.yml` | `lint-pr-title`: the pull request title follows Conventional Commits |
+| `dependency-review.yml` | `audit-dependencies`: a pull request may not add a vulnerable dependency |
+| `labeler.yml` | Labels a pull request from the paths it changes (`.github/labeler.yml`) |
+| `scorecard.yml` | OpenSSF Scorecard, weekly and on `development`; results go to code scanning |
+| `stale.yml` | Marks and closes issues and pull requests that have gone quiet |
+| `release.yml` | Publishes a version with its release files and attestations; see [security.md](./security.md#verifying-a-release) |
 
 ## Workflow interface for consumer repos
 
@@ -178,8 +214,6 @@ jobs:
     uses: ops-lane/checks-toolkit/.github/workflows/ci.yml@v0.1.0
     with:
       platform-ref: v0.1.0   # must match the @ref above, see below
-    secrets:
-      platform-read-token: ${{ secrets.CHECKS_TOOLKIT_READ_TOKEN }}
 
   security:
     permissions:
@@ -189,16 +223,14 @@ jobs:
     uses: ops-lane/checks-toolkit/.github/workflows/security.yml@v0.1.0
     with:
       platform-ref: v0.1.0
-    secrets:
-      platform-read-token: ${{ secrets.CHECKS_TOOLKIT_READ_TOKEN }}
 ```
 
 Things every caller has to know:
 
 - **`platform-ref` is required and must equal the `@ref` in `uses:`.** A reusable workflow can't see which ref of itself it was called with, so it needs the value to check out its own actions (see `decisions.md`, row "Calling `ci.yml`'s actions from an external repo").
-- **`platform-read-token`** is only needed while `checks-toolkit` is private: a token with read access to it (the caller's default token has none). Not needed once the repo is public.
+- **`platform-read-token`** is an optional secret. It is only needed if `checks-toolkit` is private (for example a private copy): a token with read access to it, because the caller's default token has none. Not needed for the public repository, so the example above leaves it out.
 - **Permissions** above are the minimum, granted on the calling job rather than the whole workflow (least privilege; `zizmor` flags the broad form): a called workflow can't get more than its caller grants, and the gate jobs request `actions: read` and `pull-requests: write` — a caller granting less has its whole run stopped at startup. The scans themselves only need `contents: read`.
-- **Optional inputs.** `ci.yml`: `fail-on-findings` (fail on broken Markdown links). `security.yml`: `fail-on-severity` (default `high`; critical and high findings block, lower ones are reported), `fail-on-findings` (make `audit-python` fail, since pip-audit has no severity) and `codeql` (default `false`: CodeQL only works on a public repository or one with GitHub Advanced Security, so switch it on yourself; Semgrep always runs). Leaked secrets always block.
+- **Optional inputs.** `ci.yml`: `fail-on-findings` (fail on zizmor findings and on broken Markdown links). `security.yml`: `fail-on-severity` (default `high`; critical and high findings block, lower ones are reported), `fail-on-findings` (make `audit-python` fail, since pip-audit has no severity) and `codeql` (default `false`: CodeQL only works on a public repository or one with GitHub Advanced Security, so switch it on yourself; Semgrep always runs). Leaked secrets always block.
 - **Two required checks.** Make `CI gate` and `Security gate` the required checks, not the individual jobs.
 - **Trigger only on `pull_request`, `push` or `workflow_dispatch`.** Both workflows refuse to run on `pull_request_target` (they would run a fork's code with write access and secrets) — see [security.md](./security.md#public-repository-and-fork-pull-requests).
 
@@ -212,8 +244,8 @@ Consumer repositories get exactly two required checks:
 
 ```mermaid
 flowchart TD
-    CI["CI → success / failure"]
-    Security["Security → success / failure"]
+    CI["CI gate → success / failure"]
+    Security["Security gate → success / failure"]
 ```
 
 Internally, these workflows may contain as many jobs as needed:

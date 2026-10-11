@@ -1,0 +1,110 @@
+name: "Lint YAML"
+description: "Checks the syntax and style of YAML files (*.yml, *.yaml) with yamllint: invalid YAML, duplicate keys, inconsistent indentation, trailing spaces and so on. Uses the platform's default rules unless the directory has its own .yamllint file. Reads the files only. Fails the step on an error; warnings are reported. Findings are written to the job summary."
+
+inputs:
+  working-directory:
+    description: "Directory to check, recursively. Defaults to the repo root."
+    required: false
+    default: "."
+  fail-on-warnings:
+    description: "Also fail the step on warnings. Default is false: errors fail, warnings are only reported."
+    required: false
+    default: "false"
+  yamllint-version:
+    description: "Exact yamllint version to install, pinned (not 'latest') so a new release cannot change the result of an unchanged PR."
+    required: false
+    default: "1.37.1"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install yamllint
+      shell: bash
+      env:
+        VERSION: ${{ inputs.yamllint-version }}
+      run: |
+        pip install --no-cache-dir --break-system-packages --ignore-installed "yamllint==${VERSION}"
+
+    - name: yamllint
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        WORKING_DIR: ${{ inputs.working-directory }}
+        FAIL_ON_WARNINGS: ${{ inputs.fail-on-warnings }}
+        DEFAULT_CONFIG: ${{ github.action_path }}/yamllint.yml
+      run: |
+        set -euo pipefail
+
+        # The YAML comes from the (possibly untrusted) pull request.
+        # yamllint only parses it, with PyYAML's safe loader; nothing in the
+        # files is executed. File names are passed as arguments, never
+        # through the shell.
+        mapfile -d '' FILES < <(find . -type f \( -name '*.yml' -o -name '*.yaml' \) \
+          -not -path './.git/*' -not -path './.checks-toolkit/*' \
+          -not -path '*/node_modules/*' -not -path '*/.venv/*' -not -path '*/venv/*' \
+          -print0 | sort -z)
+
+        if [ "${#FILES[@]}" -eq 0 ]; then
+          {
+            echo "### lint-yaml — \`$WORKING_DIR\`"
+            echo ""
+            echo "No YAML files found."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+        fi
+
+        # A config file of the repository wins over the platform's default.
+        CONFIG=(-c "$DEFAULT_CONFIG")
+        for own in .yamllint .yamllint.yml .yamllint.yaml; do
+          if [ -f "$own" ]; then CONFIG=(); break; fi
+        done
+
+        # Exit codes: 0 = clean, 1 = errors, 2 = warnings only (with
+        # --strict), anything else is yamllint itself failing.
+        set +e
+        yamllint "${CONFIG[@]}" -f parsable "${FILES[@]}" > "$RUNNER_TEMP/yamllint.txt" 2> "$RUNNER_TEMP/yamllint.err"
+        exit_code=$?
+        set -e
+
+        if [ "$exit_code" -gt 1 ]; then
+          echo "::error::yamllint failed to run (exit code $exit_code)"
+          cat "$RUNNER_TEMP/yamllint.err"
+          exit 1
+        fi
+
+        ERRORS=$(grep -c ': \[error\] ' "$RUNNER_TEMP/yamllint.txt" || true)
+        WARNINGS=$(grep -c ': \[warning\] ' "$RUNNER_TEMP/yamllint.txt" || true)
+
+        # yamllint also exits 1 for a broken config file or an unreadable
+        # file. Exit 1 without a single finding is therefore a tool error and
+        # must not pass.
+        if [ "$exit_code" -eq 1 ] && [ $((ERRORS + WARNINGS)) -eq 0 ]; then
+          echo "::error::yamllint failed to run - a tool error, not a finding."
+          cat "$RUNNER_TEMP/yamllint.err"
+          exit 1
+        fi
+
+        {
+          echo "### lint-yaml — \`$WORKING_DIR\`"
+          echo ""
+          echo "Files checked: **${#FILES[@]}** — errors: **$ERRORS**, warnings: **$WARNINGS**"
+          if [ $((ERRORS + WARNINGS)) -gt 0 ]; then
+            echo ""
+            echo "| File | Line | Level | Problem |"
+            echo "|---|---|---|---|"
+            jq -R -r '
+              capture("^(?<f>.*):(?<l>[0-9]+):(?<c>[0-9]+): \\[(?<lvl>[a-z]+)\\] (?<m>.*)$")?
+              | "| `\(.f | sub("^\\./"; "") | gsub("\\|"; "\\|"))` | \(.l) | \(.lvl) | \(.m | gsub("\\|"; "\\|")) |"' \
+              "$RUNNER_TEMP/yamllint.txt" | head -n 200
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        if [ "$ERRORS" -gt 0 ]; then
+          echo "::error::yamllint found $ERRORS error(s) in $WORKING_DIR"
+          exit 1
+        fi
+        if [ "$WARNINGS" -gt 0 ] && [ "$FAIL_ON_WARNINGS" = "true" ]; then
+          echo "::error::yamllint found $WARNINGS warning(s) in $WORKING_DIR (fail-on-warnings is on)"
+          exit 1
+        fi
+        echo "No YAML errors."

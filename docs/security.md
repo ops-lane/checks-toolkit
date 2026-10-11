@@ -117,8 +117,8 @@ and reviewable.
   one-week cooldown so a freshly published (possibly compromised) release is
   not among the first to be taken.
 - **Container tools are pinned by digest** (Trivy, Gitleaks, Semgrep,
-  lychee) and **Python packages by exact version** (Ruff, mypy, pip-audit,
-  codespell, Poetry, pipenv). Dependabot cannot update these, so they are
+  lychee, ShellCheck) and **Python packages by exact version** (Ruff, mypy,
+  pip-audit, codespell, yamllint, PyYAML, Poetry, pipenv). Dependabot cannot update these, so they are
   bumped by hand — [contributing.md](./contributing.md#pinned-versions) lists
   where they live.
 - **Checkouts do not keep the token.** Every `actions/checkout` uses
@@ -130,6 +130,36 @@ and reviewable.
   request (`detect-changes` turns them into component paths). The rule and
   the incident that prompted it are in [decisions.md](./decisions.md), row
   "Untrusted values reach scripts only through `env:`".
+
+## Verifying a release
+
+A release is more than a tag. A release published by the current `Release`
+workflow carries three files, and each file has a signed build provenance attestation, made by the
+`Release` workflow with a short-lived identity from GitHub (no key to keep):
+
+- `checks-toolkit-<tag>.tar.gz`: the source of exactly the tagged commit
+- `checks-toolkit-<tag>.spdx.json`: an SBOM (a list of what the project is
+  built from), taken from GitHub's dependency graph
+- `SHA256SUMS`: the checksums of the other two
+
+To check a download, with the GitHub CLI:
+
+```bash
+gh attestation verify checks-toolkit-v0.2.0.tar.gz --repo ops-lane/checks-toolkit
+sha256sum --check SHA256SUMS
+```
+
+The first command proves the file was built by this repository's `Release`
+workflow from this repository; the second that the three files belong
+together. Releases are also immutable (files and tag cannot change after
+publishing), which is why the files are attached to a draft that is published
+only afterwards. `v0.1.0` predates this and has no files.
+
+The repository also grades itself: the OpenSSF Scorecard workflow
+(`scorecard.yml`) reports supply-chain practices such as branch protection,
+pinned dependencies and token permissions to code scanning, and
+`dependency-review.yml` blocks a pull request that adds a dependency with a
+known high-severity vulnerability.
 
 ## Public repository and fork pull requests
 

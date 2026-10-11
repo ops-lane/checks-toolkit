@@ -1,0 +1,45 @@
+name: Stale
+
+# Marks issues and pull requests that have gone quiet, and closes them if
+# nobody reacts. Nothing is deleted, and a comment or a new commit lifts the
+# mark. Labels that mean "this stays open on purpose" are exempt.
+on:
+  schedule:
+    - cron: "30 5 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  stale:
+    # Not in a fork.
+    if: github.repository == 'ops-lane/checks-toolkit'
+    runs-on: ubuntu-26.04
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - name: stale
+        uses: actions/stale@4391f3da665fdf50b6810c1a66712fb9ba21aa93 # v11.0.0
+        with:
+          days-before-issue-stale: 60
+          days-before-issue-close: 14
+          days-before-pr-stale: 30
+          days-before-pr-close: 14
+          exempt-issue-labels: "security,help wanted,good first issue,tech-debt"
+          exempt-pr-labels: "security,dependencies"
+          exempt-all-milestones: true
+          exempt-draft-pr: true
+          stale-issue-message: >
+            This issue has had no activity for 60 days, so it is marked as
+            stale. A comment keeps it open; without one it is closed in 14 days.
+          stale-pr-message: >
+            This pull request has had no activity for 30 days, so it is marked
+            as stale. A comment or a new commit keeps it open; without one it
+            is closed in 14 days.
+          close-issue-message: >
+            Closed because there was no activity after it was marked as stale.
+            Reopen it if it still matters.
+          close-pr-message: >
+            Closed because there was no activity after it was marked as stale.
+            Reopen it if you want to continue.

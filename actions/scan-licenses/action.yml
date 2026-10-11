@@ -1,0 +1,124 @@
+name: "Scan Licenses"
+description: "Checks the licenses of a project's dependencies with Trivy (trivy fs --scanners license) and classifies them by risk, for example GPL-3.0 as high and MIT as low. Reads the files only: no installs, no credentials, no network. Fails the step when a license at or above fail-on-severity is found; every finding is written to the job summary."
+
+inputs:
+  working-directory:
+    description: "Directory to scan — one component's path from detect-changes' components[] in a monorepo. Defaults to the repo root. Scanned recursively."
+    required: false
+    default: "."
+  fail-on-severity:
+    description: "Lowest license risk that fails this step: critical, high, medium, low, or none (never fail, report only). Trivy classes licenses as critical (forbidden), high (restricted), medium (reciprocal) and low (notice or permissive). Default is high, so forbidden and restricted licenses block while the rest is only reported."
+    required: false
+    default: "high"
+  ignored-licenses:
+    description: "Comma-separated SPDX license names to leave out, for example for a dependency you have a separate agreement for. Empty ignores nothing."
+    required: false
+    default: ""
+
+outputs:
+  result:
+    description: "License counts per severity as JSON: {unknown, low, medium, high, critical, total}"
+    value: ${{ steps.scan.outputs.result }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Scan licenses
+      id: scan
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        WORKING_DIR: ${{ inputs.working-directory }}
+        FAIL_ON_SEVERITY: ${{ inputs.fail-on-severity }}
+        IGNORED_LICENSES: ${{ inputs.ignored-licenses }}
+        # Same pinned Trivy image as scan-docker and scan-terraform - bump all
+        # three together.
+        TRIVY_IMAGE: ghcr.io/aquasecurity/trivy:0.75.0@sha256:af6acf9a6b85dfe389a1941505c0ce9efef52a4719635e1a962f022a3d855daa
+      run: |
+        case "$FAIL_ON_SEVERITY" in
+          critical|high|medium|low|none) ;;
+          *) echo "::error::fail-on-severity must be critical, high, medium, low or none (got '$FAIL_ON_SEVERITY')"; exit 1 ;;
+        esac
+
+        EXTRA=()
+        if [ -n "$IGNORED_LICENSES" ]; then
+          if ! [[ "$IGNORED_LICENSES" =~ ^[A-Za-z0-9.+,_-]+$ ]]; then
+            echo "::error::ignored-licenses must be comma-separated SPDX names (letters, digits and . + _ - only)."
+            exit 1
+          fi
+          EXTRA=(--ignored-licenses "$IGNORED_LICENSES")
+        fi
+
+        # The files come from the (possibly untrusted) pull request, so Trivy
+        # runs in a throwaway container: files mounted read-only, no
+        # capabilities, no credentials, no network, own user. Trivy only
+        # reads the lock files and installed-package metadata; it never
+        # installs or runs anything. License scanning needs no database, so
+        # nothing has to be downloaded.
+        set +e
+        docker run --rm \
+          --network none \
+          --cap-drop ALL \
+          --security-opt no-new-privileges \
+          --user "$(id -u):$(id -g)" \
+          --env HOME=/tmp --env TRIVY_CACHE_DIR=/tmp/trivy \
+          --volume "$PWD":/src:ro \
+          "$TRIVY_IMAGE" fs /src \
+            --scanners license \
+            --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL \
+            --format json --quiet \
+            "${EXTRA[@]}" \
+          > "$RUNNER_TEMP/trivy-licenses.json" 2> "$RUNNER_TEMP/trivy-licenses.err"
+        exit_code=$?
+        set -e
+
+        if [ "$exit_code" -ne 0 ] || ! jq -e '.SchemaVersion' "$RUNNER_TEMP/trivy-licenses.json" > /dev/null 2>&1; then
+          echo "::error::Trivy failed to run (exit code $exit_code) - this is a tool/execution error, not a finding."
+          tail -n 30 "$RUNNER_TEMP/trivy-licenses.err"
+          exit 1
+        fi
+
+        RESULT=$(jq -c '[.Results[]? | select(.Class == "license") | .Licenses[]?.Severity] as $s
+          | {unknown: ($s | map(select(. == "UNKNOWN")) | length),
+             low: ($s | map(select(. == "LOW")) | length),
+             medium: ($s | map(select(. == "MEDIUM")) | length),
+             high: ($s | map(select(. == "HIGH")) | length),
+             critical: ($s | map(select(. == "CRITICAL")) | length),
+             total: ($s | length)}' "$RUNNER_TEMP/trivy-licenses.json")
+        echo "result=$RESULT" >> "$GITHUB_OUTPUT"
+        TOTAL=$(echo "$RESULT" | jq .total)
+
+        BLOCKING=$(echo "$RESULT" | jq --arg t "$FAIL_ON_SEVERITY" '
+          ["critical","high","medium","low"] as $order
+          | if $t == "none" then 0
+            else ($order | index($t)) as $i | [$order[:$i + 1][] as $s | .[$s]] | add end')
+
+        {
+          echo "### scan-licenses — \`$WORKING_DIR\`"
+          echo ""
+          echo "Licenses found: **$TOTAL** — critical $(echo "$RESULT" | jq .critical), high $(echo "$RESULT" | jq .high), medium $(echo "$RESULT" | jq .medium), low $(echo "$RESULT" | jq .low), unknown $(echo "$RESULT" | jq .unknown)"
+          if [ "$TOTAL" -gt 0 ]; then
+            echo ""
+            echo "| Package | License | Risk | Class | File |"
+            echo "|---|---|---|---|---|"
+            jq -r '
+              {"CRITICAL":0,"HIGH":1,"MEDIUM":2,"LOW":3,"UNKNOWN":4} as $rank
+              | [.Results[]? | select(.Class == "license") | .Licenses[]?]
+              | sort_by($rank[.Severity])
+              | .[:100][]
+              | "| `\(.PkgName | gsub("\\|"; "\\|"))` | \(.Name | gsub("\\|"; "\\|")) | \(.Severity) | \(.Category) | `\(.FilePath // "-")` |"' "$RUNNER_TEMP/trivy-licenses.json"
+            [ "$TOTAL" -le 100 ] || echo "| ... | | | | $((TOTAL - 100)) more not shown |"
+          fi
+          echo ""
+          if [ "$FAIL_ON_SEVERITY" = "none" ]; then
+            echo "_Report only (fail-on-severity: none)._"
+          else
+            echo "_Fails on **$FAIL_ON_SEVERITY** and above: $BLOCKING license(s) at or above that level._"
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        if [ "$BLOCKING" -gt 0 ]; then
+          echo "::error::$BLOCKING license(s) at '$FAIL_ON_SEVERITY' or above in $WORKING_DIR"
+          exit 1
+        fi
+        echo "$TOTAL license(s), none at '$FAIL_ON_SEVERITY' or above."

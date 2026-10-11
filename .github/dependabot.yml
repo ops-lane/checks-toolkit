@@ -15,6 +15,9 @@ updates:
     # a delay keeps this repo from being among the first to take one.
     cooldown:
       default-days: 7
+    labels:
+      - "dependencies"
+      - "github-actions"
     commit-message:
       prefix: "ci(deps)"
     groups:

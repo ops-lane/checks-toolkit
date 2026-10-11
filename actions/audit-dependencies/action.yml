@@ -1,0 +1,61 @@
+name: "Audit Dependencies"
+description: "Reviews the dependencies a pull request adds or changes, across every ecosystem GitHub's dependency graph supports (including GitHub Actions), and fails when a change introduces a known vulnerability at or above fail-on-severity. Wraps GitHub's official dependency-review-action. Needs the dependency graph, which is on for public repositories and needs GitHub Advanced Security for private ones."
+
+inputs:
+  fail-on-severity:
+    description: "Lowest severity of a newly introduced vulnerability that fails this step: critical, high, medium, low, or none (never fail, report only). Default is high, so critical and high block while medium and low are only reported."
+    required: false
+    default: "high"
+  base-ref:
+    description: "Commit SHA or ref to compare from. Empty uses the base of the pull request, which is what you want for a pull_request event. Needed to run outside a pull request."
+    required: false
+    default: ""
+  head-ref:
+    description: "Commit SHA or ref to compare to. Empty uses the head of the pull request."
+    required: false
+    default: ""
+  token:
+    description: "Token for the GitHub API (the dependency graph comparison). Needs contents: read."
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  vulnerable-changes:
+    description: "The added or changed dependencies with a known vulnerability, as JSON (empty list when there are none)."
+    value: ${{ steps.review.outputs.vulnerable-changes }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Resolve the severity
+      id: severity
+      shell: bash
+      env:
+        FAIL_ON_SEVERITY: ${{ inputs.fail-on-severity }}
+      run: |
+        # This platform says critical/high/medium/low/none everywhere; the
+        # reviewed action says low/moderate/high/critical and has no "none",
+        # which is its warn-only switch.
+        case "$FAIL_ON_SEVERITY" in
+          critical|high|low) severity="$FAIL_ON_SEVERITY"; warn=false ;;
+          medium)            severity="moderate";           warn=false ;;
+          none)              severity="low";                warn=true  ;;
+          *) echo "::error::fail-on-severity must be critical, high, medium, low or none (got '$FAIL_ON_SEVERITY')"; exit 1 ;;
+        esac
+        echo "severity=$severity" >> "$GITHUB_OUTPUT"
+        echo "warn-only=$warn" >> "$GITHUB_OUTPUT"
+
+    - name: Review the dependency changes
+      id: review
+      uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+      with:
+        repo-token: ${{ inputs.token }}
+        fail-on-severity: ${{ steps.severity.outputs.severity }}
+        warn-only: ${{ steps.severity.outputs.warn-only }}
+        base-ref: ${{ inputs.base-ref }}
+        head-ref: ${{ inputs.head-ref }}
+        # Licenses are scan-licenses' job; vulnerabilities are this one's.
+        license-check: false
+        # The result is in the job summary; a pull request comment would need
+        # pull-requests: write, which the scans do not otherwise have.
+        comment-summary-in-pr: never

@@ -11,6 +11,9 @@ short version:
   direction can be agreed before you spend time on it.
 - **Security problems are not public issues.** See [SECURITY.md](SECURITY.md).
 - **English** for everything: code comments, docs, commits, issues.
+- **Changes go through a pull request** with signed commits and a passing
+  `CI gate` and `Security gate`; see
+  [docs/contributing.md](docs/contributing.md#pull-requests-and-branch-rules).
 - **These workflows run in other people's pipelines**, so changes to
   `.github/workflows/` and `actions/` follow stricter rules: no
   `${{ }}` inside scripts (pass values through `env:`), every `uses:` pinned

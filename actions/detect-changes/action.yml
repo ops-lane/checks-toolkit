@@ -111,6 +111,18 @@ runs:
         TERRAFORM_COMPONENTS=$(build_type_json "terraform" -iname "*.tf")
         MARKDOWN_COMPONENTS=$(build_type_json "markdown" -iname "*.md")
 
+        # GitHub only runs workflows from .github/workflows of the repo root,
+        # so "workflows" is a single component for the whole repo, not one
+        # per directory. It is present when there is a workflow file, or a
+        # composite action (action.yml), which the workflow checkers read too.
+        WORKFLOW_FILES=$(find .github/workflows -maxdepth 1 -type f \( -iname '*.yml' -o -iname '*.yaml' \) 2>/dev/null | head -n 1)
+        ACTION_FILES=$(find_component_dirs -iname "action.yml" -o -iname "action.yaml" | head -n 1)
+        if [ -n "$WORKFLOW_FILES" ] || [ -n "$ACTION_FILES" ]; then
+          WORKFLOWS_COMPONENTS='[{"path":".","type":"workflows"}]'
+        else
+          WORKFLOWS_COMPONENTS='[]'
+        fi
+
         # One component per (directory, type) pair, deduplicated even when
         # multiple manifests of the same type sit in the same directory
         # (e.g. both pyproject.toml and requirements.txt at the root).
@@ -119,7 +131,8 @@ runs:
           <(echo "$NODE_COMPONENTS") \
           <(echo "$DOCKER_COMPONENTS") \
           <(echo "$TERRAFORM_COMPONENTS") \
-          <(echo "$MARKDOWN_COMPONENTS"))
+          <(echo "$MARKDOWN_COMPONENTS") \
+          <(echo "$WORKFLOWS_COMPONENTS"))
 
         # project.* is derived from components, not computed separately —
         # one source of truth, so the two can never drift out of sync.
@@ -128,7 +141,8 @@ runs:
           node: any(.[]; .type == "node"),
           docker: any(.[]; .type == "docker"),
           terraform: any(.[]; .type == "terraform"),
-          markdown: any(.[]; .type == "markdown")
+          markdown: any(.[]; .type == "markdown"),
+          workflows: any(.[]; .type == "workflows")
         }')
 
         echo "components=$COMPONENTS" >> "$GITHUB_OUTPUT"
@@ -182,6 +196,7 @@ runs:
             docker: [/(^|\/)dockerfile$/i, /(^|\/)compose\.yml$/i, /(^|\/)docker-compose\.yml$/i],
             terraform: [/\.tf$/i],
             markdown: [/\.md$/i],
+            workflows: [/^\.github\/workflows\/.+\.ya?ml$/i, /(^|\/)action\.ya?ml$/i, /^\.github\/dependabot\.ya?ml$/i],
           };
 
           // A file is "under" a component if it lives in that component's

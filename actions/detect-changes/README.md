@@ -15,7 +15,9 @@ Finds every component (a directory containing a recognized manifest, at any dept
 
 | Name | Description |
 |---|---|
-| `result` | JSON string: `{ "project": {...}, "changed": {...}, "components": [...] }`. `project.*`/`changed.*` are booleans per capability (`python`, `node`, `docker`, `terraform`, `markdown`), **derived from** `components`, not computed separately. `components` is `[{ "path": "...", "type": "...", "changed": true/false }]`, one entry per directory+capability found in the repo. |
+| `result` | JSON string: `{ "project": {...}, "changed": {...}, "components": [...] }`. `project.*`/`changed.*` are booleans per capability (`python`, `node`, `docker`, `terraform`, `markdown`, `workflows`), **derived from** `components`, not computed separately. `components` is `[{ "path": "...", "type": "...", "changed": true/false }]`, one entry per directory+capability found in the repo (`workflows` is a single entry for the repo root). |
+| `base-ref` | The commit SHA the changes were compared from (the resolved `base-ref` input, or the PR base / previous push commit). Lets other checks, like `scan-secrets`, scan exactly the same range. |
+| `head-ref` | The commit SHA the changes were compared to (the resolved `head-ref` input, or the PR head / pushed commit). |
 
 ## How it works
 
@@ -67,8 +69,9 @@ flowchart TD
 - **Root component over-matches.** The root component (`path: "."`) matches every changed file, including ones that already belong to a more specific nested component of the same type — this can mark a root-level component as "changed" when the actual change was scoped to a nested component. Over-triggers, never under-triggers (see [roadmap.md](../../docs/roadmap.md), "Known limitations").
 - **No include-relationship detection.** Every manifest found is treated as its own independent component; manifests that reference each other (e.g. a `requirements/dev.txt` that `-r`-includes `requirements/base.txt`) are not merged, so they can be audited redundantly rather than incorrectly.
 - **GitHub compare API truncation.** The API caps the `files` list around ~300 changed files for very large diffs; a warning is logged when this happens, but `changed.*`/`components[].changed` may be incomplete for that diff.
+- **`workflows` is one component for the whole repo.** GitHub only runs workflows from `.github/workflows` of the repository root, so the component is always `.`. It is present when that folder has a workflow file or the repo has a composite `action.yml`, and it counts as changed when a workflow, an `action.yml` or `dependabot.yml` changed.
 - **Fixed noise-directory exclusion list.** `.git`, `.checks-toolkit` (the platform's own checkout that `ci.yml` places in the workspace root — without this its files showed up as components of the consumer repo), `node_modules`, `.venv`, `venv`, `__pycache__`, `.terraform`, `dist`, `build` are hardcoded in the action; not configurable per consumer repo.
-- **HTML/web and other uncovered capabilities are invisible.** Only the five capabilities in the signal table (Python, Node, Docker, Terraform, Markdown) are recognized — anything else is silently ignored, not flagged as unknown.
+- **HTML/web and other uncovered capabilities are invisible.** Only the six capabilities in the signal table (Python, Node, Docker, Terraform, Markdown, Workflows) are recognized — anything else is silently ignored, not flagged as unknown.
 
 ## Related documentation
 

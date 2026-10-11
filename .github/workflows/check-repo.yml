@@ -1,0 +1,64 @@
+name: Check repository
+
+# Checks the files of this repository itself: that every action's README
+# matches its action.yml, that CODEOWNERS is valid, and that the shell and
+# YAML in the repository are clean. Deliberately independent of ci.yml, like
+# check-workflows.yml: the checker must not depend on the thing it checks.
+on:
+  pull_request:
+    branches: [development]
+  push:
+    branches: [development]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint-action-docs:
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: lint-action-docs
+        uses: ./actions/lint-action-docs
+        with:
+          index-file: docs/workflows.md
+
+  lint-codeowners:
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: lint-codeowners
+        uses: ./actions/lint-codeowners
+        with:
+          required: true
+
+  lint-shell:
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: lint-shell
+        uses: ./actions/lint-shell
+
+  lint-yaml:
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: lint-yaml
+        uses: ./actions/lint-yaml

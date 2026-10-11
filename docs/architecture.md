@@ -12,7 +12,7 @@ is built, how well it is verified and what is next, see
 
 ```mermaid
 flowchart TD
-    A["Consumer repo<br/>(uses: ...@v1)"] --> B[checks-toolkit]
+    A["Consumer repo<br/>(uses: ...@v0.1.0)"] --> B[checks-toolkit]
     B --> C[detect]
     C --> D[decide]
     D --> E[execute]
@@ -56,7 +56,7 @@ flowchart TD
 |---|---|---|
 | Use | A single reusable building block | A complete procedure/pipeline |
 | Example | `actions/detect-changes` | `.github/workflows/ci.yml` |
-| Call | `uses: ops-lane/checks-toolkit/actions/detect-changes@v1` | `uses: ops-lane/checks-toolkit/.github/workflows/ci.yml@v1` |
+| Call | `uses: ops-lane/checks-toolkit/actions/detect-changes@v0.1.0` | `uses: ops-lane/checks-toolkit/.github/workflows/ci.yml@v0.1.0` |
 
 ## Versioning
 
@@ -91,7 +91,7 @@ To avoid scope creep, we deliberately do **not** build, for now:
 - Self-hosted GitHub Enterprise
 - Complex policy engines
 - Automatic code remediation
-- Support for every programming language (MVP: only Python, Node, Docker, Terraform, Markdown)
+- Support for every programming language (for now: only Python, Node, Docker, Terraform, Markdown)
 - A standalone GitHub App for PR comments/ChatOps — plain GitHub Actions
   (`actions/github-script`, a thin `on: issue_comment` workflow) covers
   status updates and comment-triggered reruns without a second,

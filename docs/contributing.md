@@ -27,7 +27,9 @@
   from an individual maintainer, however popular — it runs with the calling
   workflow's permissions and secrets, and a compromised maintainer account
   is a real supply-chain risk (see [decisions.md](./decisions.md), row
-  "Third-party Actions policy"). If a capability isn't covered by an
+  "Third-party Actions policy"). One deliberate exception: OpenSSF's own
+  `scorecard-action`, see row "OpenSSF Scorecard is the one Action outside the
+  policy". If a capability isn't covered by an
   official Action, build a composite action for it here instead of reaching
   for a community one.
 - **Every composite action must be standalone-callable.** Define explicit
@@ -69,7 +71,10 @@ whenever a security advisory for one of the tools appears.
 
 | What | Where | Pinned as |
 |---|---|---|
-| Trivy | `actions/scan-docker`, `actions/scan-terraform` | container image, version + digest (the two must match) |
+| Trivy | `actions/scan-docker`, `actions/scan-terraform`, `actions/scan-licenses`, `actions/build-sbom` | container image, version + digest (all four must match) |
+| ShellCheck | `actions/lint-shell` | container image, version + digest |
+| yamllint | `actions/lint-yaml` | exact pip version (`yamllint-version` input) |
+| PyYAML | `actions/lint-action-docs`, `actions/lint-shell` | exact pip version (`pyyaml-version` input) |
 | Gitleaks | `actions/scan-secrets` | container image, version + digest |
 | Semgrep | `actions/scan-code` | container image, version + digest |
 | lychee | `actions/lint-markdown` | container image, version + digest |
@@ -117,6 +122,30 @@ principle in [architecture.md](./architecture.md)).
 - A new version is run against `ops-lane/checks-toolkit-test` first, before
   a real project repo is upgraded.
 
+## Pull requests and branch rules
+
+A repository ruleset applies to every branch of this repository. In practice:
+
+- **Changes go through a pull request.** Nothing is pushed to `development`
+  directly; deleting a branch or force-pushing is blocked.
+- **`CI gate` and `Security gate` must pass.** They are the two required
+  checks; see [workflows.md](./workflows.md).
+- **The code owner reviews.** `.github/CODEOWNERS` assigns everything to the
+  maintainer, and the rule asks for that review. No approval count is
+  required, so a single maintainer can still merge.
+- **Commits must be signed** (GPG, SSH or S/MIME, shown as *Verified* on
+  GitHub). An unsigned commit in a pull request cannot be merged.
+- **A set of checks runs on every pull request** besides the two gates:
+  `check-repo` (action docs, CODEOWNERS, shell, YAML), `check-commits`,
+  `check-pr-title`, `check-workflows` (when workflows change) and
+  `dependency-review`. See [workflows.md](./workflows.md#this-repositorys-other-workflows).
+  They are not required checks yet.
+- **Organisation admins can bypass the ruleset.** That is how the maintainer
+  can release and repair things; it is not a way around review for anyone else.
+
+A pull request is merged with a merge commit, so every commit's subject is
+checked (see the next section).
+
 ## Commit messages
 
 Commit subjects follow [Conventional Commits](https://www.conventionalcommits.org):
@@ -127,7 +156,9 @@ type or scope marks a breaking change (`feat(api)!: ...`). A security fix is
 
 The release notes are generated from these subjects, so the `check-commits`
 workflow fails a pull request that has a commit without one. Merge commits
-are not checked. The type decides the section a commit lands in (`feat` under
+are not checked. The pull request title follows the same format, checked by
+the `check-pr-title` workflow, because it becomes the commit subject if a pull
+request is ever merged by squashing. The type decides the section a commit lands in (`feat` under
 Added, `fix` under Fixed, `fix(security)` under Security, and so on; see
 `cliff.toml`).
 
@@ -153,14 +184,24 @@ version, higher than the latest stable one, and its tag does not exist yet;
 the run is on the default branch; and every check run on that commit has
 passed. It refuses otherwise.
 
+**Release files.** A real release also builds the source archive of the
+commit, an SBOM and `SHA256SUMS`, attests all three with build provenance, and
+attaches them to a draft release that is published afterwards (releases are
+immutable, so files cannot be added later). A dry run builds the files and
+lists their checksums but attests and publishes nothing. How to verify them is
+in [security.md](./security.md#verifying-a-release). This part of the workflow
+has not run on GitHub yet; read the dry run before the first real release with
+it.
+
 **Hand-written notes.** If `.github/release-notes/v<version>.md` exists, it is
-used instead of the generated notes. The first release needs this: the history
-is squashed before the repository goes public, so there are no commits to
+used instead of the generated notes. The first release needed this: the public
+repository started from a single initial commit, so there were no commits to
 generate notes from.
 
-**One-time setting:** switch on *immutable releases* in the repository
-settings before the first release, so a published release and its tag can
-never be changed afterwards. It does not apply retroactively.
+**Setting:** *immutable releases* are switched on in the repository settings,
+so a published release and its tag can never be changed afterwards. It does
+not apply retroactively, so a copy of this repository needs it before its
+first release.
 
 ## Per-action README
 

@@ -1,0 +1,29 @@
+# Rules for .github/workflows/labeler.yml: a label is added to a pull request
+# when it changes at least one file that matches. Labels are only added, never
+# removed, so a label set by hand stays. The labels have to exist already.
+
+documentation:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "docs/**"
+          - "**/*.md"
+
+github-actions:
+  - changed-files:
+      - any-glob-to-any-file:
+          - ".github/workflows/**"
+          - ".github/labeler.yml"
+          - ".github/dependabot.yml"
+          - "actions/**"
+
+security:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "SECURITY.md"
+          - "docs/security.md"
+          - "actions/audit-*/**"
+          - "actions/scan-*/**"
+          - ".github/workflows/security.yml"
+          - ".github/workflows/dependency-review.yml"
+          - ".github/workflows/scorecard.yml"
+          - ".github/zizmor.yml"

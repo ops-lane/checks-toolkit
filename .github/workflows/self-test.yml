@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       fail-on-findings:
-        description: "Fail audit-python when vulnerabilities are found, and lint-markdown when it finds broken links"
+        description: "Fail audit-python when vulnerabilities are found, lint-markdown when it finds broken links, and scan-workflows when zizmor reports findings"
         required: false
         type: boolean
         default: false

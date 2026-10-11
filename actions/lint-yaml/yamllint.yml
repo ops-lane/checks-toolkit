@@ -1,0 +1,28 @@
+# Default yamllint rules for the platform. A consumer repo overrides these by
+# committing its own .yamllint, .yamllint.yml or .yamllint.yaml in the
+# directory that is checked: lint-yaml then uses that file instead.
+extends: default
+
+rules:
+  # Long lines are normal in workflows (URLs, long expressions, descriptions).
+  line-length: disable
+
+  # Not every YAML file starts with ---; GitHub's own files do not.
+  document-start: disable
+
+  # "on:" is a key in workflows. yamllint's default would read it as a
+  # boolean and complain, so only values are checked, not keys.
+  truthy:
+    check-keys: false
+
+  # A comment next to a value needs one space, which is how most people write it.
+  comments:
+    min-spaces-from-content: 1
+
+  # Comment indentation is a matter of taste and fights with commented-out blocks.
+  comments-indentation: disable
+
+  # Lists under a key are written both ways; the file just has to be consistent.
+  indentation:
+    spaces: consistent
+    indent-sequences: consistent

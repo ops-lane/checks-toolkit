@@ -25,15 +25,22 @@ on:
           - lint-markdown
           - scan-secrets
           - scan-code
+          - lint-action-docs
+          - lint-codeowners
+          - lint-shell
+          - lint-yaml
+          - scan-licenses
+          - audit-dependencies
+          - build-sbom
       working-directory:
         description: "Directory the action runs in (the component path) - used by every action that takes a working-directory, so point it at a folder in this repo that has something to check. Defaults to the repo root."
         required: false
         default: "."
       base-ref:
-        description: "Only used when action=detect-changes: commit SHA to compare from. Leave empty to fall back to event-based resolution (which, under workflow_dispatch, has no real diff and reports no changes)."
+        description: "Only used when action=detect-changes or audit-dependencies: commit SHA to compare from. Leave empty to fall back to event-based resolution (which, under workflow_dispatch, has no real diff and reports no changes)."
         required: false
       head-ref:
-        description: "Only used when action=detect-changes: commit SHA to compare to. Leave empty to fall back to event-based resolution."
+        description: "Only used when action=detect-changes or audit-dependencies: commit SHA to compare to. Leave empty to fall back to event-based resolution."
         required: false
 
 permissions:
@@ -163,6 +170,55 @@ jobs:
           python: "true"
           node: "true"
           docker: "true"
+
+      - name: lint-action-docs
+        if: inputs.action == 'lint-action-docs'
+        id: lint-action-docs
+        uses: ./actions/lint-action-docs
+        with:
+          index-file: docs/workflows.md
+
+      - name: lint-codeowners
+        if: inputs.action == 'lint-codeowners'
+        id: lint-codeowners
+        uses: ./actions/lint-codeowners
+        with:
+          required: true
+
+      - name: lint-shell
+        if: inputs.action == 'lint-shell'
+        id: lint-shell
+        uses: ./actions/lint-shell
+        with:
+          working-directory: ${{ inputs.working-directory }}
+
+      - name: lint-yaml
+        if: inputs.action == 'lint-yaml'
+        id: lint-yaml
+        uses: ./actions/lint-yaml
+        with:
+          working-directory: ${{ inputs.working-directory }}
+
+      - name: scan-licenses
+        if: inputs.action == 'scan-licenses'
+        id: scan-licenses
+        uses: ./actions/scan-licenses
+        with:
+          working-directory: ${{ inputs.working-directory }}
+
+      # Outside a pull request the two refs have to be given.
+      - name: audit-dependencies
+        if: inputs.action == 'audit-dependencies'
+        id: audit-dependencies
+        uses: ./actions/audit-dependencies
+        with:
+          base-ref: ${{ inputs.base-ref }}
+          head-ref: ${{ inputs.head-ref }}
+
+      - name: build-sbom
+        if: inputs.action == 'build-sbom'
+        id: build-sbom
+        uses: ./actions/build-sbom
 
       - name: Show outputs
         if: always()

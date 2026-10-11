@@ -1,0 +1,23 @@
+name: Labeler
+
+# Puts labels on a pull request from the paths it changes (the rules are in
+# .github/labeler.yml). Uses the pull_request trigger, not pull_request_target:
+# a fork's pull request has a read-only token and is skipped, because labels
+# are a convenience and not worth running with write access for a fork.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  label:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: labeler
+        uses: actions/labeler@bf12e9b00b37c5c0ca2b87b79b2daf7891dbda13 # v7.0.0

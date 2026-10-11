@@ -28,9 +28,11 @@ still change between versions.
 | Docker | `docker build` | Trivy image scan |
 | Terraform | `terraform fmt -check` | Trivy misconfiguration scan |
 | Markdown | markdownlint, codespell, lychee | — |
+| Workflows | actionlint, zizmor (report only) | — |
 | Whole repository | — | Gitleaks (always), Semgrep, CodeQL (off by default, switch on with `codeql: true`) |
-| This repository's own workflows | actionlint, zizmor (`check-workflows.yml`, not part of `ci.yml`) | — |
-| This repository's own commits | Conventional Commits on every pull request (`check-commits.yml`) | — |
+| This repository's own workflows | actionlint, zizmor (`check-workflows.yml`) | — |
+| This repository's own files | Action READMEs against `action.yml`, CODEOWNERS, ShellCheck, yamllint (`check-repo.yml`) | Dependency review (`dependency-review.yml`), OpenSSF Scorecard (`scorecard.yml`) |
+| This repository's own commits | Conventional Commits on every pull request, commits and title (`check-commits.yml`, `check-pr-title.yml`) | — |
 
 Plus the building blocks around them: `detect-changes` (which technologies
 are present, what changed, per component), `ci-gate` (one verdict and a
@@ -43,7 +45,7 @@ result table per workflow), the `skip-ci` label, and the severity policy
 | Level | What it covers |
 |---|---|
 | Run on GitHub | Everything in `ci.yml` and `security.yml` except CodeQL. A test consumer (`checks-toolkit-test`) calls both workflows over 20+ scenarios, each with an expected result: the right check fails for the right reason, the others pass, a hostile folder name is treated as text, a secret added and removed in a later commit is found without its value being printed, the `skip-ci` label skips everything and its removal restores the checks, and the two gate comments stay separate. The platform's self-test covers the Markdown matrix, the full-history secret scan and the new-branch fallback |
-| Not yet seen | A pull request from a fork (needs a public repository), a caller that triggers on `pull_request_target`, and `fail-on-findings: true` on `audit-python` |
+| Not yet seen | The `workflows` job of `ci.yml`; `check-repo.yml`, `dependency-review.yml`, `labeler.yml`, `scorecard.yml` and `stale.yml`; the SBOM, archive and attestations in `release.yml`; a pull request from a fork (the repository is public now, so this can be tried), a caller that triggers on `pull_request_target`, and `fail-on-findings: true` on `audit-python` |
 | Not run at all | **CodeQL.** It is off by default because it needs a public repository or GitHub Advanced Security; only its result mapping was tested. Semgrep, the other half of `scan-code`, has run locally |
 
 Each action's own README says exactly what was verified for it. Closing the
@@ -54,19 +56,22 @@ Each action's own README says exactly what was verified for it. Closing the
 Releases are exact tags, never moved, each with a GitHub Release. They are
 published by the `Release` workflow, started by hand with a typed version; the
 notes are generated from Conventional Commit subjects by git-cliff. See
-[contributing.md](./contributing.md#releasing). The pipeline itself has not
-been run yet: a dry run is the first step.
+[contributing.md](./contributing.md#releasing). `v0.1.0` was published this way,
+with hand-written notes.
 
 ## Next
 
-1. Run both workflows end to end on a test consumer repository, including a
-   deliberately failing change per tool and the `skip-ci` label.
-2. First real CodeQL run, once the repository is public: switch it on with `codeql: true`.
+1. Close the "not yet seen" row: a pull request from a fork, a caller that
+   triggers on `pull_request_target`, and `fail-on-findings: true` on
+   `audit-python`.
+2. First real CodeQL run: switch it on with `codeql: true` in the self-test.
 3. Phase 4: central Mergify configuration.
 4. Scheduled (nightly) full scans: CodeQL, dependencies and container images
    across the whole repository instead of per pull request.
-5. Offer `lint-workflows` and `scan-workflows` to consumer repositories through `ci.yml` (needs a `detect-changes` signal for workflows), and switch `zizmor` from report-only to blocking now that this repository's own baseline is clean.
-6. Self-hosted runners (see [runners.md](./runners.md)). The platform runs on
+5. Run the `workflows` capability on a real pull request (it is wired into `ci.yml` but has not run on GitHub), and switch `zizmor` from report-only to blocking now that this repository's own baseline is clean.
+6. Offer `lint-shell`, `lint-yaml`, `scan-licenses` and `audit-dependencies` to consumer repositories, as capabilities of `ci.yml` and `security.yml`, once they have proven themselves on this repository.
+7. First run of the release files: a dry run, then a real release, and `gh attestation verify` on the result.
+8. Self-hosted runners (see [runners.md](./runners.md)). The platform runs on
    GitHub-hosted runners today; self-hosted is a later, deliberate step with
    its own isolation requirements.
 
@@ -100,6 +105,6 @@ list is in [architecture.md](./architecture.md#non-goals).
 - **The root component over-matches in monorepos.** A change inside a nested
   component can also mark a root-level component of the same type as changed.
   It over-triggers and never under-triggers.
-- **`check-workflows.yml` can be skipped by a pull request that changes it.** GitHub runs the workflow file from the pull request, so only branch protection with required checks closes this; branch protection is not available yet on the free plan for a private repository.
+- **`check-workflows.yml` can be skipped by a pull request that changes it.** GitHub runs the workflow file from the pull request, so a pull request can skip its own check. Making that check required in the repository ruleset closes this.
 - **`terraform validate` is not implemented**; it needs provider downloads and
   its own supply-chain design.

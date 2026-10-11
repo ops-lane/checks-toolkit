@@ -1,0 +1,25 @@
+name: Dependency review
+
+# Looks at the dependencies a pull request adds or changes, including the
+# GitHub Actions it uses, and fails when one of them brings in a known
+# vulnerability at high severity or above. Deliberately independent of
+# security.yml, which is the workflow consumers call: this one is for this
+# repository's own pull requests.
+on:
+  pull_request:
+    branches: [development]
+
+permissions:
+  contents: read
+
+jobs:
+  audit-dependencies:
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: audit-dependencies
+        uses: ./actions/audit-dependencies

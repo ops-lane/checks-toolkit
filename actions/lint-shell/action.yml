@@ -1,0 +1,164 @@
+name: "Lint Shell"
+description: "Checks shell scripts with ShellCheck: every *.sh file, and the bash/sh run: blocks of composite actions (action.yml), which actionlint does not look at. Workflow run: blocks are left to lint-workflows. Reads the files only; nothing is executed. Fails the step on any finding at or above the chosen severity; findings are written to the job summary."
+
+inputs:
+  working-directory:
+    description: "Directory to check, recursively. Defaults to the repo root."
+    required: false
+    default: "."
+  severity:
+    description: "Lowest ShellCheck severity that is reported and fails this step: error, warning, info or style. Default is warning."
+    required: false
+    default: "warning"
+  pyyaml-version:
+    description: "Exact PyYAML version to install (used to read the action.yml files), pinned so a new release cannot change the result of an unchanged PR."
+    required: false
+    default: "6.0.3"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install PyYAML
+      shell: bash
+      env:
+        VERSION: ${{ inputs.pyyaml-version }}
+      run: |
+        pip install --no-cache-dir --break-system-packages --ignore-installed "pyyaml==${VERSION}"
+
+    - name: ShellCheck
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        WORKING_DIR: ${{ inputs.working-directory }}
+        SEVERITY: ${{ inputs.severity }}
+        # Official ShellCheck image, pinned by version AND digest: a tag can
+        # be re-pointed, a digest cannot. Bump both together.
+        SHELLCHECK_IMAGE: koalaman/shellcheck:v0.11.0@sha256:61862eba1fcf09a484ebcc6feea46f1782532571a34ed51fedf90dd25f925a8d
+      run: |
+        set -euo pipefail
+
+        case "$SEVERITY" in
+          error|warning|info|style) ;;
+          *) echo "::error::severity must be error, warning, info or style (got '$SEVERITY')"; exit 1 ;;
+        esac
+
+        # 1. Collect the scripts. The run: blocks of composite actions are
+        #    written out as files so ShellCheck can read them; the Python
+        #    below only parses YAML and writes text, it executes nothing.
+        EXTRACTED="$RUNNER_TEMP/lint-shell"
+        rm -rf "$EXTRACTED"
+        mkdir -p "$EXTRACTED"
+        python3 - "$EXTRACTED" <<'PY'
+        import os
+        import re
+        import sys
+
+        import yaml
+
+        out = sys.argv[1]
+        skip_dirs = {".git", ".checks-toolkit", "node_modules", ".venv", "venv", "__pycache__", ".terraform"}
+        mapping = {}
+        n = 0
+        for root, dirs, files in os.walk("."):
+            dirs[:] = sorted(d for d in dirs if d not in skip_dirs)
+            for name in sorted(files):
+                if name not in ("action.yml", "action.yaml"):
+                    continue
+                path = os.path.join(root, name)
+                try:
+                    with open(path, encoding="utf-8") as fh:
+                        doc = yaml.safe_load(fh) or {}
+                except Exception:
+                    continue  # not valid YAML: lint-yaml reports that
+                steps = (doc.get("runs") or {}).get("steps") or []
+                for i, step in enumerate(steps):
+                    if not isinstance(step, dict) or "run" not in step:
+                        continue
+                    shell = str(step.get("shell", "bash")).split()[0]
+                    if shell not in ("bash", "sh"):
+                        continue
+                    n += 1
+                    label = step.get("name") or f"step {i + 1}"
+                    # An expression is replaced by a placeholder, like
+                    # actionlint does, so the rest of the script still parses.
+                    body = re.sub(r"\$\{\{.*?\}\}", "__GHA_EXPRESSION__", str(step["run"]), flags=re.S)
+                    file = f"{n:04d}.sh"
+                    with open(os.path.join(out, file), "w", encoding="utf-8") as fh:
+                        fh.write(f"#!/usr/bin/env {shell}\n{body}\n")
+                    mapping[file] = f"{os.path.relpath(path)} — step \"{label}\""
+        with open(os.path.join(out, "mapping.json"), "w", encoding="utf-8") as fh:
+            import json
+            json.dump(mapping, fh)
+        PY
+
+        mapfile -d '' SCRIPTS < <(find . -type f -name '*.sh' \
+          -not -path './.git/*' -not -path './.checks-toolkit/*' \
+          -not -path '*/node_modules/*' -not -path '*/.venv/*' -not -path '*/venv/*' \
+          -print0 | sort -z)
+        mapfile -t EXTRACTED_FILES < <(find "$EXTRACTED" -maxdepth 1 -name '*.sh' | sort)
+
+        TOTAL=$(( ${#SCRIPTS[@]} + ${#EXTRACTED_FILES[@]} ))
+        if [ "$TOTAL" -eq 0 ]; then
+          {
+            echo "### lint-shell — \`$WORKING_DIR\`"
+            echo ""
+            echo "No shell scripts found."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+        fi
+
+        # 2. ShellCheck runs in a throwaway container: the files are mounted
+        #    read-only, no capabilities, no network, no credentials. It only
+        #    parses the scripts; it never runs them.
+        ARGS=()
+        for f in "${SCRIPTS[@]}"; do ARGS+=("/src/${f#./}"); done
+        for f in "${EXTRACTED_FILES[@]}"; do ARGS+=("/extracted/$(basename "$f")"); done
+
+        set +e
+        docker run --rm \
+          --network none \
+          --cap-drop ALL \
+          --security-opt no-new-privileges \
+          --user "$(id -u):$(id -g)" \
+          --volume "$PWD":/src:ro \
+          --volume "$EXTRACTED":/extracted:ro \
+          "$SHELLCHECK_IMAGE" \
+            --format=json1 --severity="$SEVERITY" \
+            "${ARGS[@]}" > "$RUNNER_TEMP/shellcheck.json" 2> "$RUNNER_TEMP/shellcheck.err"
+        exit_code=$?
+        set -e
+
+        # ShellCheck exits 1 when it has findings; anything that is not valid
+        # JSON means it did not run.
+        if ! jq -e '.comments' "$RUNNER_TEMP/shellcheck.json" > /dev/null 2>&1; then
+          echo "::error::ShellCheck failed to run (exit code $exit_code) - a tool error, not a finding."
+          tail -n 30 "$RUNNER_TEMP/shellcheck.err"
+          exit 1
+        fi
+
+        COUNT=$(jq '.comments | length' "$RUNNER_TEMP/shellcheck.json")
+
+        {
+          echo "### lint-shell — \`$WORKING_DIR\`"
+          echo ""
+          echo "Scripts checked: **${#SCRIPTS[@]}** file(s) and **${#EXTRACTED_FILES[@]}** action step(s) — findings: **$COUNT** (severity $SEVERITY and above)"
+          if [ "$COUNT" -gt 0 ]; then
+            echo ""
+            echo "| Where | Line | Code | Level | Problem |"
+            echo "|---|---|---|---|---|"
+            jq -r --slurpfile map "$EXTRACTED/mapping.json" '
+              .comments[]
+              | (.file | sub("^/src/"; "") | sub("^/extracted/"; "")) as $f
+              | ($map[0][$f] // $f) as $where
+              | "| `\($where | gsub("\\|"; "\\|"))` | \(.line) | SC\(.code) | \(.level) | \(.message | gsub("\n"; " ") | gsub("\\|"; "\\|")) |"' \
+              "$RUNNER_TEMP/shellcheck.json"
+          fi
+          echo ""
+          echo "_The line is the line within the script. For an action step that is the line of its \`run:\` block._"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        if [ "$COUNT" -gt 0 ]; then
+          echo "::error::ShellCheck found $COUNT problem(s) at '$SEVERITY' or above in $WORKING_DIR"
+          exit 1
+        fi
+        echo "No ShellCheck findings."

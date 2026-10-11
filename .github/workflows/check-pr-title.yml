@@ -1,0 +1,28 @@
+name: Check PR title
+
+# A pull request title becomes the commit subject when the pull request is
+# merged by squashing, and the release notes are generated from commit
+# subjects (git-cliff). Deliberately separate from check-commits.yml: a title
+# is edited without any push, so this workflow also runs on `edited`, and
+# the commits do not need to be checked again then.
+on:
+  pull_request:
+    branches: [development]
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  lint-pr-title:
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: lint-pr-title
+        uses: ./actions/lint-pr-title
+        with:
+          title: ${{ github.event.pull_request.title }}

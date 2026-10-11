@@ -1,0 +1,169 @@
+name: "Lint Action Docs"
+description: "Checks that every composite action in a directory has a README that matches its action.yml: the required sections and a Mermaid diagram, every input and output documented, and nothing documented that the action does not have. Optionally checks that each action is also listed in an index file. Reads files only. Fails the step on any finding; findings are written to the job summary."
+
+inputs:
+  actions-directory:
+    description: "Directory whose subdirectories are the actions to check. Defaults to actions."
+    required: false
+    default: "actions"
+  index-file:
+    description: "Optional Markdown file that has to mention every action by name in backticks, for example docs/workflows.md. Empty skips the check."
+    required: false
+    default: ""
+  pyyaml-version:
+    description: "Exact PyYAML version to install, pinned (not 'latest') so a new release cannot change the result of an unchanged PR."
+    required: false
+    default: "6.0.3"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install PyYAML
+      shell: bash
+      env:
+        VERSION: ${{ inputs.pyyaml-version }}
+      run: |
+        pip install --no-cache-dir --break-system-packages --ignore-installed "pyyaml==${VERSION}"
+
+    - name: Check action docs
+      shell: bash
+      env:
+        ACTIONS_DIR: ${{ inputs.actions-directory }}
+        INDEX_FILE: ${{ inputs.index-file }}
+      run: |
+        # The README text and the action.yml files come from the pull
+        # request, so they are only ever read as data by the script below;
+        # nothing in them is executed.
+        set +e
+        python3 - > "$RUNNER_TEMP/action-docs.md" <<'PY'
+        import os
+        import re
+        import sys
+
+        import yaml
+
+        REQUIRED_HEADINGS = ["Inputs", "Outputs", "How it works", "Usage", "Known issues / Limitations"]
+
+
+        def strip_code(text):
+            """Remove fenced code blocks, so '# comment' lines are not read as headings."""
+            return re.sub(r"^```.*?^```", "", text, flags=re.S | re.M)
+
+
+        def table_names(section):
+            """First-column backticked names of the Markdown table in a section."""
+            names = []
+            for line in section.splitlines():
+                m = re.match(r"^\|\s*`([^`]+)`\s*\|", line)
+                if m:
+                    names.append(m.group(1))
+            return names
+
+
+        def section_of(text, heading):
+            m = re.search(r"^## " + re.escape(heading) + r"\s*$(.*?)(?=^## |\Z)", strip_code(text), re.S | re.M)
+            return m.group(1) if m else None
+
+
+        def check_action(path, name):
+            findings = []
+            action_file = None
+            for candidate in ("action.yml", "action.yaml"):
+                if os.path.isfile(os.path.join(path, candidate)):
+                    action_file = os.path.join(path, candidate)
+            if action_file is None:
+                return None  # not an action directory (for example a shared folder)
+
+            with open(action_file, encoding="utf-8") as fh:
+                action = yaml.safe_load(fh) or {}
+            if not action.get("name") or not action.get("description"):
+                findings.append("action.yml needs a `name` and a `description`")
+
+            inputs = list((action.get("inputs") or {}).keys())
+            outputs = list((action.get("outputs") or {}).keys())
+            for key, spec in (action.get("inputs") or {}).items():
+                if not (spec or {}).get("description"):
+                    findings.append(f"input `{key}` has no description in action.yml")
+
+            readme = os.path.join(path, "README.md")
+            if not os.path.isfile(readme):
+                findings.append("no README.md")
+                return findings
+            with open(readme, encoding="utf-8") as fh:
+                text = fh.read()
+            plain = strip_code(text)
+
+            if not re.search(r"^# `" + re.escape(name) + r"`\s*$", plain, re.M):
+                findings.append(f"the title should be `# \\`{name}\\``")
+            if "**Origin:**" not in text:
+                findings.append("no `**Origin:**` line (in-house, or which Action it wraps)")
+            if "```mermaid" not in text:
+                findings.append("no Mermaid diagram")
+            for heading in REQUIRED_HEADINGS:
+                if section_of(text, heading) is None:
+                    findings.append(f"no `## {heading}` section")
+
+            for kind, names in (("Inputs", inputs), ("Outputs", outputs)):
+                section = section_of(text, kind)
+                if section is None:
+                    continue
+                documented = table_names(section)
+                for item in names:
+                    if item not in documented:
+                        findings.append(f"{kind.lower()[:-1]} `{item}` is in action.yml but not in the README table")
+                for item in documented:
+                    if item not in names:
+                        findings.append(f"README documents {kind.lower()[:-1]} `{item}`, which action.yml does not have")
+            return findings
+
+
+        def main():
+            actions_dir = os.environ.get("ACTIONS_DIR", "actions")
+            index_file = os.environ.get("INDEX_FILE", "")
+
+            names = sorted(
+                d for d in os.listdir(actions_dir) if os.path.isdir(os.path.join(actions_dir, d))
+            ) if os.path.isdir(actions_dir) else []
+
+            results = {}
+            for name in names:
+                found = check_action(os.path.join(actions_dir, name), name)
+                if found is not None:
+                    results[name] = found
+
+            if index_file:
+                if not os.path.isfile(index_file):
+                    results.setdefault("(index)", []).append(f"index file `{index_file}` does not exist")
+                else:
+                    with open(index_file, encoding="utf-8") as fh:
+                        index = fh.read()
+                    for name in results:
+                        if name != "(index)" and f"`{name}`" not in index:
+                            results[name].append(f"not mentioned in `{index_file}`")
+
+            total = sum(len(v) for v in results.values())
+            print("### lint-action-docs")
+            print()
+            print(f"Actions checked: **{len(results)}** — findings: **{total}**")
+            if total:
+                print()
+                print("| Action | Finding |")
+                print("|---|---|")
+                for name, found in results.items():
+                    for item in found:
+                        print(f"| `{name}` | {item.replace('|', chr(92) + '|')} |")
+            return 1 if total else 0
+
+
+        sys.exit(main())
+        PY
+        exit_code=$?
+        set -e
+
+        cat "$RUNNER_TEMP/action-docs.md" >> "$GITHUB_STEP_SUMMARY"
+
+        if [ "$exit_code" -ne 0 ]; then
+          echo "::error::The action docs do not match the actions. See the job summary."
+          exit 1
+        fi
+        echo "Every action README matches its action.yml."
